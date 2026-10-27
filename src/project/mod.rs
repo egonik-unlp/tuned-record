@@ -5,6 +5,7 @@
 //! <dir>/sources/backing.wav f32, project rate
 //! <dir>/sources/vocals.wav  f32, project rate
 //! <dir>/cache/reference.f0  reference contour (keyed by stem hash + analyzer version)
+//! <dir>/cache/stretch-<source>-<pct>.wav (+ .key)  a source rendered for a practice speed
 //! <dir>/takes/take-NNN.wav  mono f32 + .f0 contour + .scores.json + .start sidecar
 //! ```
 
@@ -17,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::audio::speed::Ratio;
 
 pub const MANIFEST: &str = "project.toml";
 pub const FORMAT_VERSION: u32 = 1;
@@ -173,6 +176,12 @@ impl Project {
 
     pub fn reference_cache(&self) -> PathBuf {
         self.dir.join("cache/reference.f0")
+    }
+
+    /// Where a source rendered for a practice speed is cached; its key sits next to it (`.key`).
+    pub fn stretch_cache(&self, source: &str, speed: Ratio) -> PathBuf {
+        self.dir
+            .join(format!("cache/stretch-{source}-{}.wav", speed.percent()))
     }
 
     pub fn takes_dir(&self) -> PathBuf {

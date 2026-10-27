@@ -3,26 +3,28 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use egui::{Key, Modifiers};
 
 use super::plot::PlotView;
-use super::session::{Pass, Session, TakeState};
+use super::session::{Pass, Session, Stretched, TakeState};
 use crate::audio::engine::{Command, Engine};
 use crate::audio::latency::{click_track, residual_by_xcorr};
 use crate::audio::mixer::{Audio, Playback, Track};
+use crate::audio::speed::{Ratio, step_speed};
 use crate::config::Config;
 use crate::feedback::Band;
 use crate::pitch::contour::Contour;
+use crate::pitch::level::{InputLevel, QuietWatch};
 use crate::pitch::live::HOP as LIVE_HOP;
 use crate::pitch::live_thread::{self, LivePoint};
-use crate::pitch::note::{cents_between, hz_to_midi};
+use crate::pitch::note::{cents_between, hz_to_midi, midi_to_hz};
 use crate::project::export::ExportReport;
 use crate::project::takes::{self, DiskControl, DiskEvent};
-use crate::project::worker::{self, Job, SourceKind, WorkerEvent};
+use crate::project::worker::{self, Job, SourceKind, StretchTicket, WorkerEvent};
 use crate::project::{Project, TakeEntry};
 
 const LIVE_KEEP_SECS: i64 = 15;
@@ -34,6 +36,7 @@ const PREROLL_SECS: f32 = 1.0;
 /// Tail after a looped phrase and after a take being listened to.
 const TAIL_SECS: f32 = 0.5;
 const HINT_SECS: u64 = 8;
+pub const NEEDS_FULL_SPEED: &str = "Recording needs 100 % speed — press . to go back";
 
 pub struct Message {
     pub text: String,
@@ -67,6 +70,16 @@ pub struct Audition {
     started: bool,
 }
 
+/// A practice speed being prepared: the transport stays at the previous speed until every source
+/// is rendered (or loaded from the cache).
+pub struct PendingSpeed {
+    pub speed: Ratio,
+    generation: u64,
+    pub fraction: f32,
+    backing: Option<Arc<Audio>>,
+    vocals: Option<Arc<Audio>>,
+}
+
 pub struct ExportDialog {
     pub dir: PathBuf,
     pub running: bool,
@@ -79,6 +92,10 @@ pub struct App {
     pub engine_error: Option<String>,
     pub rate: u32,
     live_rx: Option<Receiver<LivePoint>>,
+    /// Mic meter, published by the live pitch thread.
+    pub input_level: Option<Arc<InputLevel>>,
+    /// Singing level during playback, for the too-quiet warning.
+    pub quiet: QuietWatch,
     disk_ctl: Option<Sender<DiskControl>>,
     disk_rx: Option<Receiver<DiskEvent>>,
     jobs: Sender<Job>,
@@ -101,6 +118,11 @@ pub struct App {
     /// Song frames repeated while playing, set with "Loop phrase".
     pub loop_range: Option<(i64, i64)>,
     pub audition: Option<Audition>,
+    /// Practice speed the transport runs at (always 100 % when a project opens).
+    pub speed: Ratio,
+    pub pending_speed: Option<PendingSpeed>,
+    /// Bumped on every speed request; stretch jobs of an older one stop.
+    stretch_generation: Arc<AtomicU64>,
     /// A short status line in the transport bar (e.g. what to do after a take).
     hint: Option<(String, Instant)>,
     last_latency_refresh: Instant,
@@ -125,6 +147,8 @@ impl App {
             engine_error: None,
             rate: 48_000,
             live_rx: None,
+            input_level: None,
+            quiet: QuietWatch::new(48_000, LIVE_HOP),
             disk_ctl: None,
             disk_rx: None,
             jobs,
@@ -145,6 +169,9 @@ impl App {
             export: None,
             loop_range: None,
             audition: None,
+            speed: Ratio::ONE,
+            pending_speed: None,
+            stretch_generation: Arc::new(AtomicU64::new(0)),
             hint: None,
             last_latency_refresh: Instant::now() - Duration::from_secs(10),
             last_pos: 0,
@@ -158,9 +185,16 @@ impl App {
                 app.rate = engine.sample_rate;
                 let (live_tx, live_rx) = unbounded();
                 let c = ctx.clone();
-                live_thread::spawn(streams.live, engine.sample_rate, live_tx, move || {
-                    c.request_repaint()
-                });
+                let level = Arc::new(InputLevel::new(engine.sample_rate));
+                live_thread::spawn(
+                    streams.live,
+                    engine.sample_rate,
+                    live_tx,
+                    level.clone(),
+                    move || c.request_repaint(),
+                );
+                app.input_level = Some(level);
+                app.quiet = QuietWatch::new(engine.sample_rate, LIVE_HOP);
                 let (ctl_tx, ctl_rx) = unbounded();
                 let (disk_tx, disk_rx) = unbounded();
                 takes::spawn_disk_thread(streams.disk, engine.sample_rate, ctl_rx, disk_tx);
@@ -228,7 +262,7 @@ impl App {
     pub fn playhead(&self) -> i64 {
         let pos = self.song_pos();
         match &self.engine {
-            Some(e) if self.playing() => pos - e.playback_latency as i64,
+            Some(e) if self.playing() => pos - e.speed().to_song(e.playback_latency as i64),
             _ => pos,
         }
     }
@@ -277,6 +311,10 @@ impl App {
     /// Plays one take with the backing from just before it starts, stopping after it ends.
     pub fn listen_to_take(&mut self, id: u32) {
         if self.recording() || !self.transport_ready() {
+            return;
+        }
+        if !self.speed.is_one() {
+            self.hint("Takes play at 100 % speed only — press . to go back");
             return;
         }
         let Some(t) = self
@@ -394,6 +432,10 @@ impl App {
             self.error("Open or create a project before recording.");
             return;
         }
+        if !self.speed.is_one() {
+            self.hint(NEEDS_FULL_SPEED);
+            return;
+        }
         if !self.transport_ready() {
             return;
         }
@@ -421,14 +463,146 @@ impl App {
         self.seek(f);
     }
 
-    pub fn push_playback(&mut self) {
+    fn current_playback(&self) -> Playback {
         let audition = self.audition.map(|a| a.take);
-        let pb = self
-            .session
+        self.session
             .as_ref()
-            .map(|s| s.playback(audition))
-            .unwrap_or_default();
+            .map(|s| s.playback(audition, self.speed))
+            .unwrap_or_default()
+    }
+
+    pub fn push_playback(&mut self) {
+        let pb = self.current_playback();
         self.send(Command::SetPlayback(Arc::new(pb)));
+    }
+
+    // ---- practice speed ---------------------------------------------------------------------
+
+    /// Asks for a practice speed. It takes effect at once when its audio is ready; otherwise the
+    /// sources are rendered (or loaded from the cache) first while the transport keeps the
+    /// previous speed. Choosing another speed meanwhile cancels the pending one.
+    pub fn set_speed(&mut self, speed: Ratio) {
+        if self.recording() || self.calibrating() {
+            return;
+        }
+        let generation = self.stretch_generation.fetch_add(1, Relaxed) + 1;
+        self.pending_speed = None;
+        let Some(s) = &self.session else {
+            self.apply_speed(speed);
+            return;
+        };
+        if speed == self.speed {
+            return;
+        }
+        if s.ready_at(speed) {
+            self.apply_speed(speed);
+            return;
+        }
+        let mut sources = Vec::new();
+        if let (Some(a), Some(src)) = (&s.backing, &s.project.manifest.backing) {
+            sources.push((SourceKind::Backing, a.clone(), s.project.path(&src.file)));
+        }
+        if let (Some((a, _)), Some(src)) = (&s.vocals, &s.project.manifest.vocals) {
+            sources.push((SourceKind::Vocals, a.clone(), s.project.path(&src.file)));
+        }
+        let n = sources.len();
+        for (k, (kind, audio, source)) in sources.into_iter().enumerate() {
+            let _ = self.jobs.send(Job::Stretch {
+                kind,
+                audio,
+                source,
+                cache: s.project.stretch_cache(kind.slug(), speed),
+                rate: s.rate(),
+                speed,
+                part: (k, n),
+                ticket: StretchTicket {
+                    generation,
+                    current: self.stretch_generation.clone(),
+                },
+            });
+        }
+        self.pending_speed = Some(PendingSpeed {
+            speed,
+            generation,
+            fraction: 0.0,
+            backing: None,
+            vocals: None,
+        });
+    }
+
+    /// One speed slower (`step` < 0) or faster than the current or pending one.
+    pub fn step_speed(&mut self, step: i32) {
+        let from = self.pending_speed.as_ref().map_or(self.speed, |p| p.speed);
+        let to = step_speed(from, step);
+        if to != from {
+            self.set_speed(to);
+        }
+    }
+
+    /// Switches clock and audio together; position and loop are kept.
+    fn apply_speed(&mut self, speed: Ratio) {
+        self.speed = speed;
+        if speed.is_one()
+            && let Some(s) = &mut self.session
+        {
+            s.stretched = None; // only the selected speed's audio is kept
+        }
+        let playback = Arc::new(self.current_playback());
+        self.send(Command::SetSpeed { speed, playback });
+    }
+
+    /// Drops any pending speed and returns to 100 % (e.g. when a source changed).
+    fn reset_speed(&mut self) {
+        self.stretch_generation.fetch_add(1, Relaxed);
+        self.pending_speed = None;
+        if let Some(s) = &mut self.session {
+            s.stretched = None;
+        }
+        self.apply_speed(Ratio::ONE);
+    }
+
+    fn stretch_progress(&mut self, generation: u64, fraction: f32) {
+        if let Some(p) = &mut self.pending_speed
+            && p.generation == generation
+        {
+            p.fraction = fraction;
+        }
+    }
+
+    fn stretched(&mut self, kind: SourceKind, generation: u64, result: Result<Arc<Audio>, String>) {
+        let Some(p) = self
+            .pending_speed
+            .as_mut()
+            .filter(|p| p.generation == generation)
+        else {
+            return;
+        };
+        let audio = match result {
+            Ok(a) => a,
+            Err(e) => {
+                let stay = self.speed.percent();
+                self.pending_speed = None;
+                self.stretch_generation.fetch_add(1, Relaxed);
+                self.hint(format!("{e} — staying at {stay} %"));
+                return;
+            }
+        };
+        match kind {
+            SourceKind::Backing => p.backing = Some(audio),
+            SourceKind::Vocals => p.vocals = Some(audio),
+        }
+        let Some(s) = &mut self.session else { return };
+        let done =
+            p.backing.is_some() == s.backing.is_some() && p.vocals.is_some() == s.vocals.is_some();
+        if done {
+            let p = self.pending_speed.take().unwrap();
+            s.stretched = Some(Stretched {
+                speed: p.speed,
+                backing: p.backing,
+                vocals: p.vocals,
+            });
+            self.apply_speed(p.speed);
+        }
     }
 
     // ---- guide ------------------------------------------------------------------------------
@@ -453,13 +627,13 @@ impl App {
             .last_voiced
             .filter(|(t, _)| t.elapsed() < LIVE_FRESH * 2)?;
         let _ = t;
-        let r = self.session.as_ref()?.target()?;
+        let s = self.session.as_ref()?;
         let at = if self.playing() {
             p.song_frame?
         } else {
             self.playhead()
         };
-        Some((p.hz?, r.hz_at(at)?))
+        Some((p.hz?, midi_to_hz(s.target_note_at(at)?.midi)))
     }
 
     pub fn snap_to_voice(&mut self) {
@@ -485,6 +659,15 @@ impl App {
         }
     }
 
+    /// Song frame a live point is compared at: where it was sung while playing, else the playhead.
+    fn reading_frame(&self, p: &LivePoint) -> Option<i64> {
+        if self.playing() {
+            p.song_frame
+        } else {
+            Some(self.playhead())
+        }
+    }
+
     /// Current live readout: (hz, deviation from the transposed target in cents if voiced).
     pub fn live_reading(&self) -> Option<(f32, Option<f32>)> {
         let (t, p) = self.last_voiced?;
@@ -493,14 +676,33 @@ impl App {
         }
         let hz = p.hz?;
         let dev = self.session.as_ref().and_then(|s| {
-            let at = if self.playing() {
-                p.song_frame?
-            } else {
-                self.playhead()
-            };
+            let at = self.reading_frame(&p)?;
             Some(cents_between(hz, s.target_hz_at(at)?))
         });
         Some((hz, dev))
+    }
+
+    /// Whether the target note the live readout is compared with is reached in this pass.
+    pub fn reading_reached(&self) -> bool {
+        let Some((_, p)) = self.last_voiced else {
+            return false;
+        };
+        self.session
+            .as_ref()
+            .and_then(|s| s.target_note_at(self.reading_frame(&p)?))
+            .is_some_and(|n| self.pass.reached.contains(&n.start))
+    }
+
+    /// Input warning for the top bar, if any: clipping first, then too quiet while singing.
+    pub fn input_warning(&self) -> Option<&'static str> {
+        let level = self.input_level.as_ref()?;
+        if level.clipping() {
+            Some("Input clipping — lower the gain")
+        } else if self.playing() && self.quiet.too_quiet() {
+            Some("Input too quiet — raise the gain")
+        } else {
+            None
+        }
     }
 
     pub fn live_band(&self) -> Option<Band> {
@@ -543,7 +745,7 @@ impl App {
         self.send(Command::SetLoop(None));
         self.pass.reset();
         self.send(Command::Seek(0));
-        self.push_playback();
+        self.reset_speed();
     }
 
     pub fn import(&mut self, kind: SourceKind, from: PathBuf) {
@@ -641,6 +843,10 @@ impl App {
         if self.engine.is_none() || self.recording() {
             return;
         }
+        if !self.speed.is_one() {
+            self.hint(NEEDS_FULL_SPEED);
+            return;
+        }
         let click = Arc::new(Audio::mono(click_track(self.rate as usize / 2, 4)));
         let prev_pos = self.song_pos();
         if let Some(ctl) = &self.disk_ctl {
@@ -653,6 +859,7 @@ impl App {
                 audio: click.clone(),
                 start: 0,
                 gain: 1.0,
+                speed: Ratio::ONE,
             }],
         })));
         self.send(Command::Play);
@@ -750,6 +957,9 @@ impl App {
                     Some("The audio server stopped. Restart the app to reconnect.".into());
             }
         }
+        if let Some(s) = &mut self.session {
+            s.refresh_notes();
+        }
         self.drain_live();
         self.drain_disk();
         self.drain_worker();
@@ -772,13 +982,22 @@ impl App {
             self.pass.reset(); // jumped
         }
         self.last_pos = pos;
+        if !playing {
+            self.quiet.clear();
+        }
 
         for p in points {
             if p.hz.is_some() {
                 self.last_voiced = Some((Instant::now(), p));
             }
             if let (true, Some(f)) = (playing, p.song_frame) {
+                self.quiet.push(p.wall_frame, p.level_db, p.clarity);
                 self.pass.add(f, p.hz, p.clarity);
+                let note = self.session.as_ref().and_then(|s| {
+                    let n = s.target_note_at(f)?;
+                    Some((n, s.target_hz_at(f)?))
+                });
+                self.pass.track_reached(f, p.hz, note, self.rate);
                 if let (Some(id), Some(s)) = (self.recording_take, &mut self.session)
                     && let Some(t) = s.takes.iter_mut().find(|t| t.entry.id == id)
                     && f >= t.entry.start_frame
@@ -976,7 +1195,16 @@ impl App {
                     if let Some(err) = s.save_now() {
                         self.error(err);
                     }
-                    self.push_playback();
+                    if self.speed.is_one() && self.pending_speed.is_none() {
+                        self.push_playback();
+                    } else {
+                        // The rendered speeds are of the old source.
+                        self.reset_speed();
+                        self.hint(format!(
+                            "Back to 100 %: the new {} is prepared again when you slow down",
+                            kind.label()
+                        ));
+                    }
                 }
                 WorkerEvent::ReferenceReady(c) => {
                     if let Some(s) = &mut self.session {
@@ -1004,6 +1232,17 @@ impl App {
                     s.takes[i].analysed = true;
                     s.rescore_take(i);
                 }
+                WorkerEvent::StretchProgress {
+                    generation,
+                    fraction,
+                    ..
+                } => self.stretch_progress(generation, fraction),
+                WorkerEvent::Stretched {
+                    kind,
+                    generation,
+                    result,
+                    ..
+                } => self.stretched(kind, generation, result),
                 WorkerEvent::Exported(r) => {
                     if let Some(d) = &mut self.export {
                         d.running = false;
@@ -1051,6 +1290,12 @@ impl App {
         if pressed(Modifiers::NONE, Key::F) {
             self.view.request_fit();
         }
+        if pressed(Modifiers::NONE, Key::Comma) {
+            self.step_speed(-1);
+        }
+        if pressed(Modifiers::NONE, Key::Period) {
+            self.step_speed(1);
+        }
         if pressed(Modifiers::NONE, Key::OpenBracket) {
             self.view.zoom_time(1.25);
         }
@@ -1093,7 +1338,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
         self.draw(ui);
-        if self.playing() || self.progress.is_some() || self.calibrating() || self.loading {
+        if self.playing()
+            || self.progress.is_some()
+            || self.pending_speed.is_some()
+            || self.calibrating()
+            || self.loading
+        {
             ctx.request_repaint();
         }
     }

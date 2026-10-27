@@ -1,18 +1,19 @@
-//! The pitch plot: note grid, fixed playhead, the target (reference or a take, transposed) with
-//! its in-tune corridor and a marker at the playhead, the reference (solid past / dashed ghost
-//! ahead), take contours, the live line coloured by deviation band, and phrase score labels.
+//! The pitch plot: note grid, fixed playhead, the target (reference or a take, transposed) as note
+//! bars with their in-tune corridor and a marker at the playhead, the raw reference dimmed beneath
+//! (solid past / dashed ghost ahead), take contours, the live line coloured by deviation band, and
+//! phrase score labels.
 
 use std::collections::VecDeque;
 
 use egui::{
-    Align2, Color32, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, WidgetInfo,
-    WidgetType,
+    Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, WidgetInfo, WidgetType,
 };
 
 use super::session::{Pass, Session};
 use super::theme;
-use crate::feedback::{Band, IN_TUNE_CENTS, NEAR_CENTS};
+use crate::feedback::{Band, IN_TUNE_CENTS, NEAR_CENTS, Note};
 use crate::pitch::contour::Contour;
+use crate::pitch::live::{BRIDGE_GAP_SECS, BRIDGE_SEMITONES, HOP as LIVE_HOP};
 use crate::pitch::live_thread::LivePoint;
 use crate::pitch::note::{cents_between, hz_to_midi, note_label};
 
@@ -26,6 +27,8 @@ pub const MAX_SPAN: f32 = 48.0;
 const GUTTER: f32 = 44.0;
 const SCORE_LANE: f32 = 22.0;
 const TICK_LANE: f32 = 16.0;
+/// Height of a note bar, in semitones.
+const BAR_ST: f32 = 0.33;
 
 pub struct PlotView {
     pub center: f32,
@@ -348,24 +351,29 @@ pub fn show(ui: &mut Ui, view: &mut PlotView, input: &PlotInput) -> PlotResponse
     // Step so that contours are drawn with about one point per pixel.
     let step_for = |c: &Contour| ((rate / pps / c.hop.max(1) as f32).floor() as usize).max(1);
 
-    // The corridor to sing in: near band, then the in-tune band on top.
-    if let Some(c) = target {
-        for (half, color) in [
-            (NEAR_CENTS, theme::BAND_NEAR),
-            (IN_TUNE_CENTS, theme::BAND_IN_TUNE),
-        ] {
-            draw_band(
-                &painter,
-                c,
-                t0,
-                t1,
-                step_for(c),
-                offset,
-                half,
-                color,
-                &x_of,
-                &y_of,
-            );
+    // The target notes in view, transposed.
+    let notes: &[Note] = session.map_or(&[], |s| {
+        let a = s.notes.partition_point(|n| n.end <= t0);
+        let b = s.notes.partition_point(|n| n.start < t1);
+        &s.notes[a..b.max(a)]
+    });
+    let x_span = |n: &Note| {
+        (
+            x_of(n.start).max(area.left()),
+            x_of(n.end).min(area.right()),
+        )
+    };
+
+    // The corridor to sing in, around each note: near band, then the in-tune band on top.
+    for (half, color) in [
+        (NEAR_CENTS, theme::BAND_NEAR),
+        (IN_TUNE_CENTS, theme::BAND_IN_TUNE),
+    ] {
+        for n in notes {
+            let m = n.midi + offset / 100.0;
+            let (a, b) = x_span(n);
+            let r = Rect::from_x_y_ranges(a..=b, y_of(m + half / 100.0)..=y_of(m - half / 100.0));
+            painter.rect_filled(r, 0.0, color);
         }
     }
 
@@ -377,6 +385,7 @@ pub fn show(ui: &mut Ui, view: &mut PlotView, input: &PlotInput) -> PlotResponse
                     ContourStyle::Dashed(theme::MELODY, 1.5)
                 });
             }
+            // Dimmed under the note bars: the detail (vibrato, scoops) without competing.
             draw_contour(
                 &painter,
                 r,
@@ -388,9 +397,9 @@ pub fn show(ui: &mut Ui, view: &mut PlotView, input: &PlotInput) -> PlotResponse
                 &y_of,
                 |f| {
                     if f <= input.playhead {
-                        ContourStyle::Solid(theme::REFERENCE, 2.0)
+                        ContourStyle::Solid(theme::CONTOUR_DIM, 1.0)
                     } else {
-                        ContourStyle::Dashed(theme::REFERENCE_GHOST, 2.0)
+                        ContourStyle::Dashed(theme::CONTOUR_DIM_GHOST, 1.0)
                     }
                 },
             );
@@ -428,8 +437,58 @@ pub fn show(ui: &mut Ui, view: &mut PlotView, input: &PlotInput) -> PlotResponse
         }
     }
 
-    // Live line, ending in a dot while the voice is current.
-    let mut prev: Option<Pos2> = None;
+    // Note bars: passed part solid (filled with a ✓ once reached), upcoming part dashed.
+    for n in notes {
+        let m = n.midi + offset / 100.0;
+        let (y0, y1) = (y_of(m + BAR_ST / 2.0), y_of(m - BAR_ST / 2.0));
+        let (a, b) = x_span(n);
+        let split = x_of(input.playhead).clamp(a, b);
+        let reached = input.pass.reached.contains(&n.start);
+        if split > a {
+            let r = Rect::from_x_y_ranges(a..=split, y0..=y1);
+            if reached {
+                painter.rect_filled(r, 2.0, theme::BAR_REACHED);
+            } else {
+                painter.rect_stroke(
+                    r,
+                    2.0,
+                    Stroke::new(1.5, theme::BAR),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        if b > split {
+            let (l, r) = (split, b);
+            let pts = [
+                Pos2::new(l, y0),
+                Pos2::new(r, y0),
+                Pos2::new(r, y1),
+                Pos2::new(l, y1),
+                Pos2::new(l, y0),
+            ];
+            painter.extend(Shape::dashed_line(
+                &pts,
+                Stroke::new(1.5, theme::BAR_GHOST),
+                5.0,
+                3.0,
+            ));
+        }
+        if reached && x_of(n.end) <= area.right() {
+            painter.text(
+                Pos2::new(x_of(n.end) + 2.0, (y0 + y1) / 2.0),
+                Align2::LEFT_CENTER,
+                "✓",
+                FontId::proportional(13.0),
+                theme::BAR_REACHED,
+            );
+        }
+    }
+
+    // Live line, ending in a dot while the voice is current. Short dropouts inside a held note
+    // are bridged (by wall time, so it looks the same at every speed).
+    let bridge = (BRIDGE_GAP_SECS * rate) as i64 + LIVE_HOP as i64;
+    // Last voiced point: position, pitch, wall frame, and whether a gap followed it.
+    let mut prev: Option<(Pos2, f32, i64, bool)> = None;
     let mut dot: Option<(Pos2, Color32)> = None;
     for p in input.live.iter().filter(|_| input.playing) {
         let Some(at) = p.song_frame else {
@@ -439,22 +498,32 @@ pub fn show(ui: &mut Ui, view: &mut PlotView, input: &PlotInput) -> PlotResponse
         };
         let x = x_of(at);
         let Some(hz) = p.hz.filter(|_| x >= area.left() && x <= area.right()) else {
-            prev = None;
+            if let Some(pr) = &mut prev {
+                pr.3 = true;
+            }
             dot = None;
             continue;
         };
-        let pos = Pos2::new(x, y_of(hz_to_midi(hz)));
+        let midi = hz_to_midi(hz);
+        let pos = Pos2::new(x, y_of(midi));
         let color = session
             .and_then(|s| s.target_hz_at(at))
             .map_or(theme::LIVE_NEUTRAL, |t| {
                 theme::band_color(Band::of(cents_between(hz, t)))
             });
-        if let Some(a) = prev.filter(|a| (a.y - pos.y).abs() < row_h * 3.0) {
+        let joins = prev.filter(|&(_, m, wall, gap)| {
+            if gap {
+                p.wall_frame - wall <= bridge && (midi - m).abs() < BRIDGE_SEMITONES
+            } else {
+                (midi - m).abs() < 3.0
+            }
+        });
+        if let Some((a, ..)) = joins {
             painter.line_segment([a, pos], Stroke::new(3.0, color));
         } else {
             painter.circle_filled(pos, 1.5, color);
         }
-        prev = Some(pos);
+        prev = Some((pos, midi, p.wall_frame, false));
         dot = Some((pos, color));
     }
     if let (Some((pos, color)), Some(_)) = (dot, last_live) {
@@ -595,52 +664,5 @@ fn draw_contour(
     }
     if let Some((d, col, wd)) = cur {
         flush(&mut pts, d, col, wd);
-    }
-}
-
-/// Fills the band `±half_cents` around a contour transposed by `offset_cents`.
-#[allow(clippy::too_many_arguments)]
-fn draw_band(
-    painter: &egui::Painter,
-    c: &Contour,
-    t0: i64,
-    t1: i64,
-    step: usize,
-    offset_cents: f32,
-    half_cents: f32,
-    color: Color32,
-    x_of: &dyn Fn(i64) -> f32,
-    y_of: &dyn Fn(f32) -> f32,
-) {
-    let half = half_cents / 100.0;
-    let mut mesh = Mesh::default();
-    let mut prev: Option<(f32, f32)> = None;
-    let range = c.index_range(t0, t1);
-    let mut i = range.start.saturating_sub(1);
-    while i < range.end.min(c.len()) {
-        match c.voiced(i) {
-            Some(hz) => {
-                let (x, m) = (x_of(c.frame_of(i)), hz_to_midi(hz) + offset_cents / 100.0);
-                if let Some((px, pm)) = prev {
-                    let base = mesh.vertices.len() as u32;
-                    for (vx, vm) in [
-                        (px, pm + half),
-                        (px, pm - half),
-                        (x, m + half),
-                        (x, m - half),
-                    ] {
-                        mesh.colored_vertex(Pos2::new(vx, y_of(vm)), color);
-                    }
-                    mesh.add_triangle(base, base + 1, base + 2);
-                    mesh.add_triangle(base + 1, base + 3, base + 2);
-                }
-                prev = Some((x, m));
-            }
-            None => prev = None,
-        }
-        i += step;
-    }
-    if !mesh.is_empty() {
-        painter.add(Shape::mesh(mesh));
     }
 }

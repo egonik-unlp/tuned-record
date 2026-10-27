@@ -10,12 +10,14 @@ Linux only. Audio goes through the JACK API on PipeWire.
 
 ```sh
 sudo apt install pipewire-jack libjack-jackd2-dev   # JACK on PipeWire + jack.pc for the build
+sudo apt install g++ libclang-dev                   # builds the time stretcher (C++)
 cargo build --release
 ```
 
 `pipewire-jack` lets JACK programs talk to the running PipeWire server; `libjack-jackd2-dev` only
 provides the pkg-config file the build needs (libjack is loaded at runtime). The app loads
-PipeWire's libjack itself, so it does not need the `pw-jack` wrapper.
+PipeWire's libjack itself, so it does not need the `pw-jack` wrapper. Slowed practice uses
+Signalsmith Stretch (MIT, C++), compiled during the build.
 
 ## Run
 
@@ -27,6 +29,10 @@ PipeWire's libjack itself, so it does not need the `pw-jack` wrapper.
 Without `pipewire-jack` the app starts but shows an "audio off" error.
 The top bar shows the devices in use (🎤 input, 🔊 output); click it to pick the microphone channel
 and the output device. The choice is remembered and reconnected whenever the device is present.
+Next to it, an **input meter** shows the mic level (bar: average, tick: peak) whether or not the
+song is playing. **"Input clipping — lower the gain"** appears when the input reaches full scale
+and stays for 2 s. **"Input too quiet — raise the gain"** appears when you sing during playback
+but so low that pitch tracking gets unreliable. It never appears for silence between phrases.
 The app asks PipeWire for 256-frame buffers (`PIPEWIRE_LATENCY`); the buffer size, rate and
 round-trip latency actually in effect are shown in the top bar.
 
@@ -40,20 +46,32 @@ through your interface's direct monitoring.
    folder: imported files are copied in, resampled to the server rate.
 2. **Import backing track…** (any mix) and **Import vocal stem…** (e.g. demucs `vocals.wav`).
    The stem is analysed once (pYIN) and cached in the project.
-3. The guide contour scrolls past a fixed playhead; what's coming is drawn dashed ahead of it.
-   The shaded corridor around it is where to sing (green: within 20 ¢), and the marker on the
-   playhead names the note to sing now. Transpose it with **−/+**, an **Interval** ("major 3rd
+3. The guide scrolls past a fixed playhead as **note bars**: one bar per sung note, at its steady
+   pitch (vibrato, wobble and the slides between notes are left out; notes are not snapped to
+   A440, so a record tuned slightly off still lines up). Bars ahead have a dashed outline. The raw
+   guide contour stays underneath, dimmed. The shaded corridor around each bar is where to sing
+   (green: within 20 ¢), and the marker on the playhead names the note to sing now. A note
+   counts as **reached** once you hold it within 20 ¢ for 100 ms (half the note, for notes
+   shorter than that). Brief dropouts don't break the hold. A reached bar fills in and gets a
+   ✓, and the readout says "✓ reached". Marks start over each time you play or jump. Transpose it with **−/+**, an **Interval** ("major 3rd
    above"), Ctrl+dragging the plot vertically (Shift: free), or **Snap to voice** while singing.
    Transposition only moves the drawing and the cents target, never the audio.
    **Navigate** with the song overview above the plot (click or drag to jump), by clicking the plot,
    dragging it while stopped, or with **⏴ Phrase / Phrase ⏵**; **⟲ Loop phrase** repeats one phrase
    for practice. Zoom time and pitch with the toolbar (or `[` `]` and `-` `=`); **Fit** frames the
    target. While stopped the plot stays still; the readout at the bottom still shows your note.
+   **Slow it down** to learn a fast phrase: **Speed** 50 / 60 / 75 / 100 % in the transport (or
+   `,` slower, `.` faster). The backing and guide play slower in the same key. The first time
+   you choose a speed, it is prepared in the background (progress on its button, a few seconds
+   per song) while playback stays at the previous speed. After that it is cached in the
+   project. Loop and position are kept. Slowed playback is for practice only: takes are muted,
+   and Record and Calibrate… ask you to go back to 100 % first. Every project opens at 100 %.
 4. **Record** (R). Earlier takes play back while you record the next one; each keeps its contour
    on the plot in its own colour. The line under the transport says what **Play** plays. When you
    stop, the playhead goes back to where the take began, so Space replays it; **▶** on a take's row
    plays just that take with the backing. While singing, the live line is coloured by deviation from the
-   transposed guide (in tune ≤ 20 ¢, near ≤ 50 ¢, off), with the numbers in the readout bar.
+   current note bar (in tune ≤ 20 ¢, near ≤ 50 ¢, off), with the numbers in the readout bar. A held
+   note is drawn as one line: dropouts shorter than 50 ms are bridged.
 5. **Harmonise**: under *What to sing*, sing against the guide or one of your takes, at an
    interval. The original melody stays drawn (dimmed) while the target is transposed.
 6. After each phrase, a **shape score** (cents) appears under it: how closely you followed the
@@ -77,6 +95,7 @@ Settings and takes are saved continuously; takes are written to disk while recor
 | [ / ] | show more / less time |
 | - / = | show more / fewer notes |
 | F | fit the pitch range to the target |
+| , / . | practice speed slower / faster (50 · 60 · 75 · 100 %) |
 | ↑ / ↓ | transpose the target ±1 semitone |
 | S | snap guide to the note you're singing |
 | G | audible guide on/off |
@@ -98,4 +117,9 @@ cargo run --release --example loopback_check               # internal patch, sil
 cargo run --release --example loopback_check -- --long     # 5-minute take
 cargo run --release --example loopback_check -- --physical # real cable loopback
 cargo run --release --example demo_project -- /tmp/demo            # synthetic demo project
+cargo run --release --example voicing_report -- take.wav  # a take through the live detector + meter
+cargo run --release --example note_report -- cache/reference.f0     # how the guide splits into notes
 ```
+
+`loopback_check` also plays a stepped tone at 60 % and checks that the live pitch lands within
+5 ms of song time.

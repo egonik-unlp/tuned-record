@@ -13,6 +13,14 @@ pub const CURRENT_ROW: Color32 = Color32::from_rgba_premultiplied(0x30, 0x34, 0x
 pub const PLAYHEAD: Color32 = Color32::from_rgb(0xe8, 0xea, 0xee);
 pub const REFERENCE: Color32 = Color32::from_rgb(0xd6, 0xd9, 0xde);
 pub const REFERENCE_GHOST: Color32 = Color32::from_rgb(0x9a, 0xa0, 0xaa);
+/// The raw target contour under the note bars (secondary: below 4.5:1 on purpose).
+pub const CONTOUR_DIM: Color32 = Color32::from_rgba_unmultiplied_const(0xd6, 0xd9, 0xde, 0x70);
+pub const CONTOUR_DIM_GHOST: Color32 =
+    Color32::from_rgba_unmultiplied_const(0x9a, 0xa0, 0xaa, 0x60);
+/// Note bars: passed (solid outline), upcoming (dashed outline), reached (filled + ✓).
+pub const BAR: Color32 = Color32::from_rgb(0xd6, 0xd9, 0xde);
+pub const BAR_GHOST: Color32 = Color32::from_rgb(0x9a, 0xa0, 0xaa);
+pub const BAR_REACHED: Color32 = Color32::from_rgb(0x4c, 0xd9, 0x64);
 pub const LIVE_NEUTRAL: Color32 = Color32::from_rgb(0xf4, 0xf4, 0xf4);
 pub const IN_TUNE: Color32 = Color32::from_rgb(0x4c, 0xd9, 0x64);
 pub const NEAR: Color32 = Color32::from_rgb(0xff, 0xb0, 0x00);

@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::pitch::contour::Contour;
-use crate::pitch::note::cents_between;
+use crate::pitch::live::{BRIDGE_GAP_SECS, BRIDGE_SEMITONES};
+use crate::pitch::note::{cents_between, hz_to_midi};
 
 pub const IN_TUNE_CENTS: f32 = 20.0;
 pub const NEAR_CENTS: f32 = 50.0;
@@ -13,6 +14,18 @@ pub const PHRASE_GAP_SECS: f32 = 0.25;
 pub const MIN_PHRASE_SECS: f32 = 0.15;
 /// A phrase is scored only if the singer was voiced on at least this share of its voiced reference.
 pub const MIN_COVERAGE: f32 = 0.5;
+/// Note segmentation: the target is median-smoothed over this long first...
+pub const NOTE_SMOOTH_SECS: f32 = 0.05;
+/// ...a note holds while the pitch stays within this of its running median (semitones)...
+pub const NOTE_BAND_ST: f32 = 0.6;
+/// ...and ends when the pitch leaves that band for at least this long (shorter is wobble).
+pub const NOTE_DEPARTURE_SECS: f32 = 0.08;
+/// Segments shorter than this inside a voiced run are glides, not notes.
+pub const MIN_NOTE_SECS: f32 = 0.08;
+/// Neighbouring segments closer than this (semitones) are one note that drifted.
+const NOTE_MERGE_ST: f32 = 0.5;
+/// A note's pitch is the median of this central share of its frames (no attack or release).
+const NOTE_CORE: f32 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Band {
@@ -134,6 +147,152 @@ pub fn shape_score(reference: &Contour, sung: &Contour, phrase: Phrase) -> Optio
     Some(ms.sqrt())
 }
 
+/// A steady note of the target, as song frames `[start, end)`, at a fractional MIDI pitch (not
+/// snapped to the 12-TET grid, and without the guide offset).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Note {
+    pub start: i64,
+    pub end: i64,
+    pub midi: f32,
+}
+
+impl Note {
+    pub fn contains(&self, frame: i64) -> bool {
+        (self.start..self.end).contains(&frame)
+    }
+}
+
+/// Segments a target contour into steady notes, ignoring vibrato, wobble and the glides between
+/// notes (see design.md → Note targets).
+pub fn notes(target: &Contour, rate: u32) -> Vec<Note> {
+    let hop = target.hop as f32;
+    if hop == 0.0 {
+        return Vec::new();
+    }
+    let frames_of = |secs: f32| ((secs * rate as f32 / hop).round() as usize).max(1);
+    let smooth = frames_of(NOTE_SMOOTH_SECS) | 1;
+    let departure = frames_of(NOTE_DEPARTURE_SECS);
+    let min_len = frames_of(MIN_NOTE_SECS);
+
+    let mut out = Vec::new();
+    for (start, run) in voiced_runs(target, frames_of(BRIDGE_GAP_SECS)) {
+        let mut segments: Vec<(usize, usize, f32)> =
+            split_run(&median_smooth(&run, smooth), departure)
+                .into_iter()
+                .map(|(a, b)| (a, b, core_median(&run[a..b])))
+                .collect();
+        // Drift: neighbours that end up close are the same note.
+        let mut k = 1;
+        while k < segments.len() {
+            let (a, _, m0) = segments[k - 1];
+            let (_, b, m1) = segments[k];
+            if (m1 - m0).abs() < NOTE_MERGE_ST {
+                segments[k - 1] = (a, b, core_median(&run[a..b]));
+                segments.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+        let keep_all = segments.len() == 1;
+        for (a, b, midi) in segments {
+            if keep_all || b - a >= min_len {
+                out.push(Note {
+                    start: target.frame_of(start + a),
+                    end: target.frame_of(start + b),
+                    midi,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Voiced runs of a contour as (first index, MIDI values). Unvoiced gaps of at most `bridge`
+/// frames between pitches less than [`BRIDGE_SEMITONES`] apart are bridged (filled linearly), so
+/// a dropout in the analysis does not split a note.
+fn voiced_runs(c: &Contour, bridge: usize) -> Vec<(usize, Vec<f32>)> {
+    let mut runs: Vec<(usize, Vec<f32>)> = Vec::new();
+    for i in 0..c.len() {
+        let Some(hz) = c.voiced(i) else { continue };
+        let m = hz_to_midi(hz);
+        let continues = |start: usize, v: &[f32]| {
+            let gap = i - (start + v.len());
+            gap == 0 || (gap <= bridge && (m - v[v.len() - 1]).abs() < BRIDGE_SEMITONES)
+        };
+        match runs.last_mut() {
+            Some((start, v)) if continues(*start, v) => {
+                let (last, gap) = (v[v.len() - 1], i - (*start + v.len()));
+                for k in 1..=gap {
+                    v.push(last + (m - last) * k as f32 / (gap + 1) as f32);
+                }
+                v.push(m);
+            }
+            _ => runs.push((i, vec![m])),
+        }
+    }
+    runs
+}
+
+/// Running median over an odd window, shrinking at the edges.
+fn median_smooth(v: &[f32], window: usize) -> Vec<f32> {
+    let half = window / 2;
+    let mut buf = Vec::with_capacity(window);
+    (0..v.len())
+        .map(|i| {
+            buf.clear();
+            buf.extend_from_slice(&v[i.saturating_sub(half)..(i + half + 1).min(v.len())]);
+            median(&mut buf)
+        })
+        .collect()
+}
+
+fn median(v: &mut [f32]) -> f32 {
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[v.len() / 2]
+}
+
+/// Splits one voiced run (smoothed MIDI) into segments `[a, b)`: a segment ends when the pitch
+/// stays out of [`NOTE_BAND_ST`] of its running median for `departure` frames; the departed
+/// frames start the next segment. Shorter excursions are absorbed (wobble).
+fn split_run(v: &[f32], departure: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut seg_start = 0;
+    let mut members: Vec<f32> = Vec::new();
+    let mut away: Option<usize> = None;
+    for (i, &m) in v.iter().enumerate() {
+        let centre = if members.is_empty() {
+            m
+        } else {
+            median(&mut members.clone())
+        };
+        if (m - centre).abs() <= NOTE_BAND_ST {
+            if let Some(a) = away.take() {
+                members.extend_from_slice(&v[a..i]);
+            }
+            members.push(m);
+        } else {
+            let a = *away.get_or_insert(i);
+            if i + 1 - a >= departure {
+                out.push((seg_start, a));
+                seg_start = a;
+                members.clear();
+                members.extend_from_slice(&v[a..=i]);
+                away = None;
+            }
+        }
+    }
+    out.push((seg_start, v.len()));
+    out.retain(|(a, b)| b > a);
+    out
+}
+
+/// Median of the central [`NOTE_CORE`] share of a note's frames.
+fn core_median(v: &[f32]) -> f32 {
+    let trim = ((v.len() as f32 * (1.0 - NOTE_CORE) / 2.0) as usize).min((v.len() - 1) / 2);
+    let mut core = v[trim..v.len() - trim].to_vec();
+    median(&mut core)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PhraseScore {
     pub phrase: Phrase,
@@ -238,6 +397,95 @@ mod tests {
         let down = shape_score(&r, &shifted(&sung, -5.0), p).unwrap();
         assert!(up > 1.0);
         assert!((up - down).abs() < 0.05, "{up} vs {down}");
+    }
+
+    /// MIDI pitch (or unvoiced) at a fraction 0..1 through a segment.
+    type Shape<'a> = &'a dyn Fn(f32) -> Option<f32>;
+
+    /// A contour at the reference's hop (256 frames) from (seconds, pitch shape) segments.
+    fn target(segs: &[(f32, Shape)]) -> Contour {
+        let hop = 256;
+        let mut c = Contour::new(0, hop);
+        for (secs, f) in segs {
+            let n = (secs * RATE as f32 / hop as f32).round() as usize;
+            for k in 0..n {
+                c.push(f(k as f32 / n as f32).map(midi_to_hz), 0.9);
+            }
+        }
+        c
+    }
+
+    fn ms(frames: i64) -> f32 {
+        frames as f32 * 1000.0 / RATE as f32
+    }
+
+    #[test]
+    fn wobbly_held_note_is_one_note() {
+        // A3 wobbling ±30 ¢ at 5.5 Hz for 400 ms.
+        let c = target(&[
+            (0.1, &|_| None),
+            (0.4, &|t| {
+                Some(57.0 + 0.3 * (t * 0.4 * 5.5 * std::f32::consts::TAU).sin())
+            }),
+            (0.1, &|_| None),
+        ]);
+        let n = notes(&c, RATE);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!((ms(n[0].end - n[0].start) - 400.0).abs() < 15.0, "{n:?}");
+        assert!((n[0].midi - 57.0).abs() < 0.1, "{n:?}");
+    }
+
+    #[test]
+    fn step_with_glide_is_two_notes() {
+        let c = target(&[
+            (0.3, &|_| Some(57.0)),
+            (0.06, &|t| Some(57.0 + 2.0 * t)),
+            (0.3, &|_| Some(59.0)),
+        ]);
+        let n = notes(&c, RATE);
+        assert_eq!(n.len(), 2, "{n:?}");
+        assert!(
+            (n[0].midi - 57.0).abs() < 0.1 && (n[1].midi - 59.0).abs() < 0.1,
+            "{n:?}"
+        );
+        // Each note keeps most of its hold; nothing in between counts as a note.
+        assert!(ms(n[0].end - n[0].start) > 280.0, "{n:?}");
+        assert!(ms(n[1].end - n[1].start) > 260.0, "{n:?}");
+    }
+
+    #[test]
+    fn analysis_dropout_does_not_split_a_note() {
+        let c = target(&[
+            (0.2, &|_| Some(64.0)),
+            (0.03, &|_| None),
+            (0.2, &|_| Some(64.1)),
+        ]);
+        let n = notes(&c, RATE);
+        assert_eq!(n.len(), 1, "{n:?}");
+    }
+
+    #[test]
+    fn slow_drift_stays_one_note() {
+        // Creeps up 0.8 st over 600 ms, as a held note going sharp.
+        let c = target(&[(0.6, &|t| Some(64.0 + 0.8 * t))]);
+        let n = notes(&c, RATE);
+        assert_eq!(n.len(), 1, "{n:?}");
+    }
+
+    #[test]
+    fn short_isolated_run_is_one_note() {
+        let c = target(&[(0.1, &|_| None), (0.03, &|_| Some(64.0)), (0.1, &|_| None)]);
+        let n = notes(&c, RATE);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!((n[0].midi - 64.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn notes_are_not_snapped_to_the_grid() {
+        // A record tuned 30 ¢ flat.
+        let c = target(&[(0.3, &|_| Some(56.7))]);
+        let n = notes(&c, RATE);
+        assert!((n[0].midi - 56.7).abs() < 0.01, "{n:?}");
     }
 
     #[test]

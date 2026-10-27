@@ -13,6 +13,7 @@ use jack::{
 
 use super::latency::compensation;
 use super::mixer::Playback;
+use super::speed::{Ratio, SongClock};
 
 pub const CLIENT_NAME: &str = "tuned-record";
 /// Buffer size requested from PipeWire (`PIPEWIRE_LATENCY`), set before the client opens.
@@ -31,12 +32,20 @@ pub enum Command {
     SetPlayback(Arc<Playback>),
     /// Song frames `[start, end)` to repeat while playing (never while recording); `None` clears.
     SetLoop(Option<(i64, i64)>),
+    /// Changes the practice speed and swaps in the playback rendered for it, in the same block,
+    /// so the clock and the audio never disagree. Ignored while recording.
+    SetSpeed {
+        speed: Ratio,
+        playback: Arc<Playback>,
+    },
 }
 
 /// State published by the audio thread, readable from any thread.
 #[derive(Default)]
 pub struct Shared {
     pub song_pos: AtomicI64,
+    /// Current practice speed ([`Ratio::to_bits`]).
+    pub speed: AtomicU32,
     pub playing: AtomicBool,
     pub recording: AtomicBool,
     /// Frames between output and capture to compensate (latency + calibration).
@@ -67,6 +76,8 @@ pub struct BlockHeader {
     pub song_frame: i64,
     pub len: u32,
     pub playing: bool,
+    /// Speed the song clock ran at during this block.
+    pub speed: Ratio,
 }
 
 /// Consumer side of a mic stream (headers + samples).
@@ -145,7 +156,7 @@ struct Processor {
     playback: Arc<Playback>,
     live: StreamProducer,
     disk: StreamProducer,
-    pos: i64,
+    clock: SongClock,
     wall: u64,
     playing: bool,
     recording: bool,
@@ -160,6 +171,20 @@ impl Processor {
             song_frame,
             len: len as u32,
             playing: self.playing,
+            speed: self.clock.ratio(),
+        }
+    }
+
+    /// Song frame of the mic sample captured now: the compensation is wall time, so it covers
+    /// fewer song frames when slowed.
+    fn captured_frame(&self, comp: i64) -> i64 {
+        self.clock.pos() - self.clock.ratio().to_song(comp)
+    }
+
+    fn retire(&mut self, old: Arc<Playback>) {
+        if let Err(rtrb::PushError::Full(old)) = self.garbage.push(old) {
+            // Never free on the audio thread; leaking is the lesser evil.
+            std::mem::forget(old);
         }
     }
 
@@ -179,27 +204,34 @@ impl Processor {
             match cmd {
                 Command::Play => self.playing = true,
                 Command::Stop => {
-                    self.stop_recording(self.pos - comp);
+                    self.stop_recording(self.captured_frame(comp));
                     self.playing = false;
                 }
                 Command::Seek(f) => {
                     if !self.recording {
-                        self.pos = f;
+                        self.clock.seek(f);
                     }
                 }
+                // Takes are recorded at 100 % only.
                 Command::StartRecord => {
-                    if !self.recording {
-                        let h = self.header(BlockKind::TakeStart, self.pos - comp, 0);
+                    if !self.recording && self.clock.ratio().is_one() {
+                        let h = self.header(BlockKind::TakeStart, self.captured_frame(comp), 0);
                         self.recording = self.disk.push(h, &[]);
                     }
                 }
-                Command::StopRecord => self.stop_recording(self.pos - comp),
+                Command::StopRecord => self.stop_recording(self.captured_frame(comp)),
                 Command::SetLoop(range) => self.loop_range = range.filter(|(s, e)| s < e),
                 Command::SetPlayback(new) => {
                     let old = std::mem::replace(&mut self.playback, new);
-                    if let Err(rtrb::PushError::Full(old)) = self.garbage.push(old) {
-                        // Never free on the audio thread; leaking is the lesser evil.
-                        std::mem::forget(old);
+                    self.retire(old);
+                }
+                Command::SetSpeed { speed, playback } => {
+                    if self.recording {
+                        self.retire(playback);
+                    } else {
+                        self.clock.set_ratio(speed);
+                        let old = std::mem::replace(&mut self.playback, playback);
+                        self.retire(old);
                     }
                 }
             }
@@ -218,11 +250,11 @@ impl jack::ProcessHandler for Processor {
         out_l.fill(0.0);
         out_r.fill(0.0);
         if self.playing {
-            self.playback.mix_into(self.pos, out_l, out_r);
+            self.playback.mix_into(self.clock.pos(), out_l, out_r);
         }
 
         let mic = self.input.as_slice(ps);
-        let song_first = self.pos - comp;
+        let song_first = self.captured_frame(comp);
         let h = self.header(BlockKind::Data, song_first, n);
         if !self.live.push(h, mic) {
             self.shared.dropped_live.fetch_add(1, Relaxed);
@@ -232,16 +264,19 @@ impl jack::ProcessHandler for Processor {
         }
 
         if self.playing {
-            self.pos += n as i64;
+            self.clock.advance(n as u64);
             if let Some((start, end)) = self.loop_range
                 && !self.recording
-                && self.pos >= end
+                && self.clock.pos() >= end
             {
-                self.pos = start;
+                self.clock.seek(start);
             }
         }
         self.wall += n as u64;
-        self.shared.song_pos.store(self.pos, Relaxed);
+        self.shared.song_pos.store(self.clock.pos(), Relaxed);
+        self.shared
+            .speed
+            .store(self.clock.ratio().to_bits(), Relaxed);
         self.shared.playing.store(self.playing, Relaxed);
         self.shared.recording.store(self.recording, Relaxed);
         Control::Continue
@@ -393,7 +428,7 @@ impl Engine {
             playback: Arc::new(Playback::default()),
             live: live_tx,
             disk: disk_tx,
-            pos: 0,
+            clock: SongClock::default(),
             wall: 0,
             playing: false,
             recording: false,
@@ -586,6 +621,11 @@ impl Engine {
 
     pub fn buffer_size(&self) -> u32 {
         self.shared.buffer_size.load(Relaxed)
+    }
+
+    /// Practice speed the song clock runs at.
+    pub fn speed(&self) -> Ratio {
+        Ratio::from_bits(self.shared.speed.load(Relaxed))
     }
 
     /// Round-trip latency in ms as currently compensated.

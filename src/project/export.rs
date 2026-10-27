@@ -9,6 +9,7 @@ use anyhow::Result;
 use super::TakeEntry;
 use super::audio_io::write_wav;
 use crate::audio::mixer::{Audio, Playback, Track, db_to_gain, take_audible};
+use crate::audio::speed::Ratio;
 
 pub struct ExportInput {
     pub name: String,
@@ -50,6 +51,7 @@ impl ExportInput {
                 audio: b.clone(),
                 start: 0,
                 gain: 1.0,
+                speed: Ratio::ONE,
             })
             .collect();
         for (t, a) in &self.takes {
@@ -58,6 +60,7 @@ impl ExportInput {
                     audio: a.clone(),
                     start: t.start_frame,
                     gain: db_to_gain(t.volume_db),
+                    speed: Ratio::ONE,
                 });
             }
         }

@@ -3,12 +3,14 @@
 
 use egui::{Align, Color32, Layout, RichText, Stroke, Ui, Vec2, WidgetInfo, WidgetType};
 
-use super::app::{App, Calibration};
+use super::app::{App, Calibration, NEEDS_FULL_SPEED};
 use super::plot::{self, PlotInput};
 use super::theme;
 use super::timeline::{self, OverviewInput};
 use crate::audio::engine::{Routing, device_of, short_port};
+use crate::audio::speed::SPEEDS;
 use crate::feedback::Band;
+use crate::pitch::level::InputLevel;
 use crate::pitch::note::NoteReading;
 use crate::project::worker::SourceKind;
 
@@ -130,6 +132,42 @@ fn device_summary(routing: &Routing) -> (String, String, bool) {
     (text, label, input.is_some() && output.is_some())
 }
 
+/// Lowest level shown by the input meter.
+const METER_FLOOR_DB: f32 = -60.0;
+
+/// Horizontal input meter: smoothed RMS as a bar, the decaying peak as a tick.
+fn input_meter(ui: &mut Ui, level: &InputLevel, warn: bool) {
+    let (rms, peak) = (level.rms_db(), level.peak_db());
+    let frac = |db: f32| ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
+    let (rect, r) = ui.allocate_exact_size(Vec2::new(80.0, 12.0), egui::Sense::hover());
+    let text = format!("Input level {rms:.0} dBFS, peak {peak:.0} dBFS");
+    r.widget_info(|| WidgetInfo::labeled(WidgetType::ProgressIndicator, true, &text));
+    r.on_hover_text(&text);
+    let p = ui.painter();
+    p.rect_filled(rect, 2.0, theme::GRID);
+    let mut fill = rect;
+    fill.set_width(rect.width() * frac(rms));
+    let color = if level.clipping() {
+        theme::OFF
+    } else if warn {
+        theme::NEAR
+    } else {
+        theme::IN_TUNE
+    };
+    p.rect_filled(fill, 2.0, color);
+    let x = rect.left() + rect.width() * frac(peak);
+    p.line_segment(
+        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+        Stroke::new(2.0, theme::PLAYHEAD),
+    );
+    p.rect_stroke(
+        rect,
+        2.0,
+        Stroke::new(1.0, theme::GRID_C),
+        egui::StrokeKind::Inside,
+    );
+}
+
 /// "Device · port" for a full port name.
 fn port_label(port: &str) -> String {
     format!("{} · {}", device_of(port), short_port(port))
@@ -212,12 +250,19 @@ impl App {
             } else {
                 RichText::new("⏺ Record")
             };
-            if labeled_button(
-                ui,
-                ready && self.session.is_some() || recording,
-                rec_text,
-                "Record / stop recording (R)",
-            ) {
+            let full_speed = self.speed.is_one();
+            let rec_enabled = ready && self.session.is_some() && full_speed || recording;
+            let rec_label = if full_speed || recording {
+                "Record / stop recording (R)"
+            } else {
+                "Recording needs 100 % speed"
+            };
+            let r = ui
+                .add_enabled(rec_enabled, egui::Button::new(rec_text))
+                .on_hover_text(rec_label)
+                .on_disabled_hover_text(rec_label);
+            r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, rec_enabled, rec_label));
+            if r.clicked() {
                 self.toggle_record();
             }
             if labeled_button(ui, ready && !recording, "⏮", "Return to start (Home)") {
@@ -250,7 +295,11 @@ impl App {
                     "Calibrate…",
                     "Measure latency with a loopback",
                 ) {
-                    self.calibration = Some(Calibration::Idle);
+                    if self.speed.is_one() {
+                        self.calibration = Some(Calibration::Idle);
+                    } else {
+                        self.hint(NEEDS_FULL_SPEED);
+                    }
                 }
                 match &self.engine {
                     Some(e) => {
@@ -280,6 +329,11 @@ impl App {
                         if labeled_button(ui, true, text, &label) {
                             self.audio_dialog = true;
                         }
+                        // Right to left: the meter sits just before the devices; its warning text
+                        // goes on the line below (no room here).
+                        if let Some(level) = &self.input_level {
+                            input_meter(ui, level, self.input_warning().is_some());
+                        }
                     }
                     None => {
                         ui.label(RichText::new("audio off").color(theme::OFF));
@@ -288,12 +342,33 @@ impl App {
             });
         });
 
-        if let Some(s) = &self.session {
+        let warning = self.input_warning();
+        if self.session.is_some() || warning.is_some() {
+            // Own line: the top row has no room left for these.
+            let speed_enabled = !self.recording() && !self.calibrating();
             ui.horizontal_wrapped(|ui| {
+                if let Some(w) = warning {
+                    let color = if w.contains("clipping") {
+                        theme::OFF
+                    } else {
+                        theme::NEAR
+                    };
+                    ui.label(RichText::new(format!("⚠ {w}")).color(color).strong());
+                    ui.separator();
+                }
+                if self.session.is_none() {
+                    return;
+                }
+                self.speed_buttons(ui, speed_enabled);
+                ui.separator();
+                let Some(s) = &self.session else { return };
                 let audition = self.audition.map(|a| a.take);
                 let mut what = match audition {
-                    Some(id) => format!("Listening to take {id}: {}", s.plays_summary(audition)),
-                    None => format!("Play plays: {}", s.plays_summary(None)),
+                    Some(id) => format!(
+                        "Listening to take {id}: {}",
+                        s.plays_summary(audition, self.speed)
+                    ),
+                    None => format!("Play plays: {}", s.plays_summary(None, self.speed)),
                 };
                 if let Some((a, b)) = self.loop_range {
                     what.push_str(&format!(
@@ -326,6 +401,36 @@ impl App {
         }
         if let Some((label, f)) = &self.progress {
             ui.add(egui::ProgressBar::new(*f).text(format!("{label}… {:.0} %", f * 100.0)));
+        }
+    }
+
+    /// Practice speed toggles; a speed being prepared shows its progress while the previous one
+    /// stays selected.
+    fn speed_buttons(&mut self, ui: &mut Ui, enabled: bool) {
+        ui.label("Speed")
+            .on_hover_text("Practice speed (, slower · . faster)");
+        for sp in SPEEDS {
+            let pct = sp.percent();
+            let selected = sp == self.speed;
+            let pending = self
+                .pending_speed
+                .as_ref()
+                .filter(|p| p.speed == sp)
+                .map(|p| (p.fraction * 100.0).round() as u32);
+            let (text, label) = match pending {
+                Some(f) => (
+                    format!("{pct} % · {f} %"),
+                    format!("Speed {pct} percent, rendering, {f} percent"),
+                ),
+                None => (format!("{pct} %"), format!("Speed {pct} percent")),
+            };
+            let r = ui
+                .add_enabled(enabled, egui::Button::selectable(selected, text))
+                .on_hover_text("Practice speed (, slower · . faster)");
+            r.widget_info(|| WidgetInfo::selected(WidgetType::Button, enabled, selected, &label));
+            if r.clicked() {
+                self.set_speed(sp);
+            }
         }
     }
 
@@ -363,6 +468,14 @@ impl App {
                             .strong()
                             .color(theme::band_color(band)),
                         );
+                        if self.reading_reached() {
+                            ui.label(
+                                RichText::new("✓ reached")
+                                    .size(18.0)
+                                    .strong()
+                                    .color(theme::BAR_REACHED),
+                            );
+                        }
                     }
                     None => {
                         ui.label(RichText::new(format!("vs {target}: —")).color(theme::TEXT_DIM));
@@ -763,8 +876,16 @@ impl App {
         let summary = match self.live_reading() {
             Some((hz, dev)) => {
                 let n = NoteReading::from_hz(hz);
-                let dev = dev.map_or(format!("no {target} here"), |d| {
-                    format!("{d:+.0} cents from {target}, {}", Band::of(d).label())
+                let reached = if self.reading_reached() {
+                    ", note reached"
+                } else {
+                    ""
+                };
+                let dev = dev.map_or(format!("no {target} note here"), |d| {
+                    format!(
+                        "{d:+.0} cents from {target}, {}{reached}",
+                        Band::of(d).label()
+                    )
                 });
                 format!(
                     "Pitch plot. Singing {} {:+.0} cents, {dev}.",
@@ -779,7 +900,22 @@ impl App {
             .as_ref()
             .map(|s| s.project.manifest.guide.offset_cents)
             .unwrap_or(0);
-        let summary = format!("{summary} Guide offset {}.", fmt_offset(offset));
+        let note_now = self
+            .session
+            .as_ref()
+            .and_then(|s| s.target_hz_at(playhead))
+            .map_or(String::new(), |hz| {
+                format!(" Note to sing: {}.", NoteReading::from_hz(hz).label())
+            });
+        let speed = if self.speed.is_one() {
+            String::new()
+        } else {
+            format!(" Practice speed {} percent.", self.speed.percent())
+        };
+        let summary = format!(
+            "{summary}{note_now} Guide offset {}.{speed}",
+            fmt_offset(offset)
+        );
         let input = PlotInput {
             session: self.session.as_ref(),
             pass: &self.pass,
