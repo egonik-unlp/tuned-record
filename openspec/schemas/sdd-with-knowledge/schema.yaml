@@ -1,0 +1,153 @@
+name: sdd-with-knowledge
+version: 5
+description: |
+  Schema SDD con integración de Graphify y documenter.
+  Agrega artefacto context.md al inicio del flujo para consolidar subgrafo + knowledge
+  antes de escribir la proposal. Reduce tokens de exploración en 60-80% para codebases medianas.
+  v5: proposal.md lleva marca de aprobación (**Estado:**) y sección "Criterios de aceptación";
+  /opsx:propose gatea los artefactos dependientes hasta el Approve explícito del usuario.
+
+artifacts:
+  - id: context
+    generates: context.md
+    description: Consolidación de subgrafo (Graphify) + knowledge humano antes de la proposal
+    template: context.md
+    instruction: |
+      Consolidar contexto ANTES de escribir la proposal. Pasos:
+      0. Completar "Entrevista de intención" con el registro de la entrevista de intención:
+         Q&A relevantes en limpio (pregunta -> respuesta, no transcript literal) + el intent brief
+         resultante (Intención / Alcance / Comportamiento observable / Non-goals /
+         Criterios de aceptación / Incertidumbres abiertas). La completa quien condujo la entrevista:
+         el cierre convergente de /opsx:explore la persiste SIEMPRE acá, y /opsx:propose la completa
+         cuando la entrevista la condujo él. Si no hubo entrevista, dejarla explícitamente vacía
+         ("Sin entrevista") — nunca sintetizar Q&A que no ocurrieron.
+         Es la única sección de autoría conversacional del archivo: no se regenera. Al iterar el
+         context (/opsx:explore <change-id>) crece por append — Q&A nuevas al final, las previas
+         intactas, y el brief se actualiza con respuestas reales.
+      1. Consultar Graphify MCP con el símbolo/feature principal del change:
+         - query_graph("<feature>") para obtener nodos relevantes
+         - get_neighbors("<main-node>") para ver dependencias directas
+         - shortest_path si hay relaciones no obvias entre módulos
+      2. Resolver el use-case por glob (knowledge/modules/*/use-cases/<name>/) y leer su spec.md, flow.md,
+         decisions.md y notes.md si existen, más el knowledge/modules/<m>/INDEX.md del módulo (navegación).
+      3. Leer knowledge/decisions.md para detectar conflictos con decisiones macro.
+      4. Listar archivos relevantes desde el subgrafo (NO desde grep).
+      5. Resumir intent humano y restricciones desde knowledge/.
+      Los pasos 1-5 son el snapshot técnico (mitad derivada, regenerable). Si todavía no se consolidó
+      —p. ej. el cierre de /opsx:explore escribió la entrevista y el usuario declinó el snapshot—
+      cada una de esas 4 secciones lleva el marcador
+      "_Pendiente — correr /opsx:explore <change-id> para consolidar el snapshot técnico._"
+      en lugar de quedar vacía o rellenada a ojo. Iterar con /opsx:explore <change-id> reemplaza esos
+      marcadores (mostrando diff y pidiendo confirmación antes de escribir).
+      Output: context.md con secciones:
+        - "Entrevista de intención" (Q&A en limpio + intent brief; conversacional, no derivada)
+        - "Nodos afectados" (desde grafo)
+        - "Archivos relevantes" (paths del subgrafo)
+        - "Contexto knowledge" (resumen de decisiones y notas relacionadas)
+        - "Riesgos identificados" (conflictos con decisions.md)
+    requires: []
+
+  - id: proposal
+    generates: proposal.md
+    description: Proposal del change, escrita sobre context.md (no sobre grep)
+    template: proposal.md
+    instruction: |
+      Escribir la proposal usando context.md como base.
+      Secciones: Why, Scope, Impact (referenciar nodos del grafo), Non-goals,
+      Criterios de aceptación, Conflictos con decisiones existentes.
+      No repetir los nodos del grafo — referenciarlos con graph://node:X o graph://community:X.
+      El contenido de cada sección lo norman las rules de este artefacto (config.yaml ->
+      rules.proposal) y los comentarios del template — no se repiten acá.
+      Tras cada (re)generación, el proposal queda pendiente: /opsx:propose presenta un gate
+      de aprobación y solo un Approve explícito del usuario escribe la marca
+      "**Estado:** Aprobado — <fecha>". Toda (re)generación la resetea a
+      "Pendiente de aprobación" — se aprueba un texto, no un archivo.
+    requires:
+      - context
+
+  - id: specs
+    generates: "specs/**/*.md"
+    description: Delta spec con ADDED/MODIFIED/REMOVED Requirements
+    template: specs.md
+    instruction: |
+      Emitir delta spec con secciones ADDED/MODIFIED/REMOVED/RENAMED Requirements,
+      en el formato que el CLI parsea (lo valida `openspec validate --strict`):
+      - Cada requirement es "### Requirement: <nombre>" — el nombre es la clave de merge
+        contra la spec viva (único y estable). Nunca variantes tipo "### REQ-N:".
+      - El texto del requirement debe contener SHALL o MUST (en inglés).
+      - Cada requirement lleva al menos un "#### Scenario: <nombre>" con Given/When/Then.
+      - MODIFIED lleva el requirement COMPLETO y actualizado (texto + todos los scenarios
+        que sobreviven), nunca solo el diff: el merge reemplaza el bloque entero por nombre.
+      Convención: el capability path es un slug plano de un solo segmento (user-auth,
+      nunca identity/user-auth) y debe coincidir 1:1 con el use-case anidado
+      en knowledge/modules/<module>/use-cases/<capability>/. El slug es único globalmente,
+      así que el documenter resuelve la ubicación por glob (knowledge/modules/*/use-cases/<capability>/).
+    requires:
+      - proposal
+
+  - id: design
+    generates: design.md
+    description: Approach técnico con referencias al grafo y rationale de decisiones
+    template: design.md
+    instruction: |
+      Describir el approach técnico.
+      Referenciar nodos concretos del grafo (graph://node:X, graph://community:X).
+      Registrar decisiones con su rationale — documenter las destila a knowledge/
+      post-archive. No hace falta marcar con flags especiales: todo lo que esté
+      en design.md se considera candidato a destilar.
+    requires:
+      - specs
+
+  - id: ui-ux
+    generates: ui-ux.md
+    description: Componentes, flujos y wireframes; accesibilidad. "No aplica" si es backend-only.
+    template: ui-ux.md
+    instruction: |
+      Especificar la superficie de UI/UX del change.
+      Primera línea bajo el heading: VEREDICTO obligatorio:
+        - "Aplica" → completar las 3 secciones.
+        - "No aplica — backend-only" + 1 línea de justificación.
+      Tres secciones si "Aplica":
+        1. Componentes y flujos: componentes nuevos/modificados, estados,
+           transiciones, eventos. Referenciar nodos del grafo si aplica
+           (graph://node:X, graph://community:X).
+        2. Wireframes / mockups: links a Figma/Stitch, o ASCII inline.
+           Si no hay diseño visual aún, listar "Sin mockup" y describir layout en prosa.
+        3. Accesibilidad: roles ARIA, navegación por teclado, contraste,
+           foco visible, lectores de pantalla. Si reutiliza primitivas ya
+           accesibles, referenciar y aclarar qué se hereda.
+      No duplicar contenido de design.md — UI/UX es la capa visible al
+      usuario, no el approach técnico.
+      No dejar el archivo vacío — siempre veredicto explícito.
+    requires:
+      - design
+
+  - id: tasks
+    generates: tasks.md
+    description: Checklist de implementación; última task siempre es /documenter distill
+    template: tasks.md
+    instruction: |
+      Lista de tasks de implementación en orden.
+      Referenciar design.md para el approach; no repetir el diseño en cada task.
+      Si ui-ux.md tiene "Aplica", incluir tasks de implementación de componentes
+      y de validación a11y.
+      La ÚLTIMA task SIEMPRE debe ser:
+        "post-archive: /documenter distill <dated-change-id> (auto-ejecutado por /opsx:archive;
+         correr a mano solo si el auto-trigger falló)"
+      Esta task sincroniza el use-case (knowledge/modules/<m>/use-cases/) con lo que shippeó el change
+      (specs narrativas, decisiones, lore). Es recordatorio/fallback: el trigger real
+      vive en /opsx:archive. Usar el change-id completo con fecha en el re-run manual.
+    requires:
+      - ui-ux
+      - design
+      - specs
+
+apply:
+  requires: [tasks]
+  tracks: tasks.md
+  instruction: |
+    Leer context.md y design.md antes de empezar. Trabajar las tasks en orden,
+    marcando cada checkbox al completarla. Si surgen decisiones nuevas durante
+    la implementación, anotarlas en design.md — documenter las destilará al
+    knowledge base post-archive.
+    Pausar si aparecen bloqueos o ambigüedades que requieran aprobación.

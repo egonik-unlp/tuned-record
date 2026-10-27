@@ -1,0 +1,54 @@
+#!/bin/sh
+# graphify-checkout-hook-start
+# Rebuilds the Graphify knowledge graph (code only) when switching branches.
+# Versioned hook — enable with: git config core.hooksPath .githooks
+# Package resolution matches post-commit (GRAPHIFY_PACKAGES env / .snappec.conf / auto-detect).
+
+BRANCH_SWITCH=$3
+[ "$BRANCH_SWITCH" != "1" ] && exit 0   # only on branch switches, not file checkouts
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+cd "$REPO_ROOT" || exit 0
+
+if [ -z "$GRAPHIFY_PACKAGES" ] && [ -f ".snappec.conf" ]; then
+    # shellcheck disable=SC1091
+    . "./.snappec.conf"
+fi
+if [ -z "$GRAPHIFY_PACKAGES" ]; then
+    GRAPHIFY_PACKAGES=$(find . -maxdepth 2 -type d -name graphify-out 2>/dev/null \
+        | sed 's#/graphify-out##; s#^\./##' | sort -u | tr '\n' ' ')
+fi
+[ -z "$GRAPHIFY_PACKAGES" ] && exit 0
+
+GRAPHIFY_BIN=$(command -v graphify 2>/dev/null)
+if [ -n "$GRAPHIFY_BIN" ]; then
+    _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | sed 's/^#![[:space:]]*//')
+    case "$_SHEBANG" in
+        */env\ *) GRAPHIFY_PYTHON="${_SHEBANG#*/env }" ;;
+        *)         GRAPHIFY_PYTHON="$_SHEBANG" ;;
+    esac
+    case "$GRAPHIFY_PYTHON" in
+        *[!a-zA-Z0-9/_.-]*) GRAPHIFY_PYTHON="python3" ;;
+    esac
+    if ! "$GRAPHIFY_PYTHON" -c "import graphify" 2>/dev/null; then
+        GRAPHIFY_PYTHON="python3"
+    fi
+else
+    GRAPHIFY_PYTHON="python3"
+fi
+"$GRAPHIFY_PYTHON" -c "import graphify" 2>/dev/null || exit 0
+
+for PKG in $GRAPHIFY_PACKAGES; do
+    [ -d "$PKG/graphify-out" ] || continue   # only if the graph was built before
+    echo "[graphify] branch switched — rebuilding graph for '$PKG' (code files)..."
+    GRAPHIFY_PKG="$PKG" "$GRAPHIFY_PYTHON" -c "
+import os
+from pathlib import Path
+try:
+    from graphify.watch import _rebuild_code
+    _rebuild_code(Path(os.environ['GRAPHIFY_PKG']))
+except Exception as exc:
+    print(f'[graphify] rebuild skipped: {exc}')
+"
+done
+# graphify-checkout-hook-end

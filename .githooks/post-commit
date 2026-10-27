@@ -1,0 +1,71 @@
+#!/bin/sh
+# graphify-hook-start
+# Auto-rebuilds the Graphify knowledge graph after each commit (code files only, no LLM needed).
+# Versioned hook — enable with: git config core.hooksPath .githooks
+#
+# Which package(s) to rebuild is NOT hardcoded. Resolution order:
+#   1. GRAPHIFY_PACKAGES env var (space-separated paths), or
+#   2. .snappec.conf at repo root (line: GRAPHIFY_PACKAGES="pkg-a pkg-b"), or
+#   3. auto-detect: every dir containing a graphify-out/ (repo root included).
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+cd "$REPO_ROOT" || exit 0
+
+CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only HEAD 2>/dev/null)
+[ -z "$CHANGED" ] && exit 0
+
+# --- resolve target packages ---
+if [ -z "$GRAPHIFY_PACKAGES" ] && [ -f ".snappec.conf" ]; then
+    # shellcheck disable=SC1091
+    . "./.snappec.conf"
+fi
+if [ -z "$GRAPHIFY_PACKAGES" ]; then
+    # auto-detect dirs with a graphify-out/ (maxdepth 2 keeps it cheap)
+    GRAPHIFY_PACKAGES=$(find . -maxdepth 2 -type d -name graphify-out 2>/dev/null \
+        | sed 's#/graphify-out##; s#^\./##' | sort -u | tr '\n' ' ')
+fi
+[ -z "$GRAPHIFY_PACKAGES" ] && exit 0
+
+# --- detect a python that can import graphify (handles pipx/venv/system) ---
+GRAPHIFY_BIN=$(command -v graphify 2>/dev/null)
+if [ -n "$GRAPHIFY_BIN" ]; then
+    _SHEBANG=$(head -1 "$GRAPHIFY_BIN" | sed 's/^#![[:space:]]*//')
+    case "$_SHEBANG" in
+        */env\ *) GRAPHIFY_PYTHON="${_SHEBANG#*/env }" ;;
+        *)         GRAPHIFY_PYTHON="$_SHEBANG" ;;
+    esac
+    case "$GRAPHIFY_PYTHON" in
+        *[!a-zA-Z0-9/_.-]*) GRAPHIFY_PYTHON="python3" ;;
+    esac
+    if ! "$GRAPHIFY_PYTHON" -c "import graphify" 2>/dev/null; then
+        GRAPHIFY_PYTHON="python3"
+    fi
+else
+    GRAPHIFY_PYTHON="python3"
+fi
+
+if ! "$GRAPHIFY_PYTHON" -c "import graphify" 2>/dev/null; then
+    echo "[graphify hook] 'graphify' no está instalado — salteando rebuild. (pipx install graphifyy)"
+    exit 0
+fi
+
+for PKG in $GRAPHIFY_PACKAGES; do
+    [ -d "$PKG" ] || continue
+    echo "[graphify hook] rebuilding graph for '$PKG'..."
+    GRAPHIFY_PKG="$PKG" "$GRAPHIFY_PYTHON" -c "
+import os, sys
+from pathlib import Path
+pkg = os.environ['GRAPHIFY_PKG']
+try:
+    from graphify.watch import _rebuild_code
+    _rebuild_code(Path(pkg))
+except Exception as exc:
+    print(f'[graphify hook] rebuild failed for {pkg}: {exc}')
+    sys.exit(0)  # never block the commit
+"
+    # freshness check if the package ships one
+    if [ -x "$PKG/scripts/check-graphify-freshness.sh" ]; then
+        "$PKG/scripts/check-graphify-freshness.sh" || true
+    fi
+done
+# graphify-hook-end
