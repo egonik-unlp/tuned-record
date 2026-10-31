@@ -11,7 +11,7 @@ use egui::{Key, Modifiers};
 
 use super::plot::PlotView;
 use super::session::{Pass, Session, Stretched, TakeState};
-use crate::audio::engine::{Command, Engine};
+use crate::audio::engine::{Command, Engine, device_of};
 use crate::audio::latency::{click_track, residual_by_xcorr};
 use crate::audio::mixer::{Audio, Playback, Track};
 use crate::audio::speed::{Ratio, step_speed};
@@ -37,6 +37,17 @@ const PREROLL_SECS: f32 = 1.0;
 const TAIL_SECS: f32 = 0.5;
 const HINT_SECS: u64 = 8;
 pub const NEEDS_FULL_SPEED: &str = "Recording needs 100 % speed — press . to go back";
+const TAKE_INTERRUPTED: &str =
+    "Recording stopped: the audio interface was reset. The take was kept up to that point.";
+/// One audio driver carries both the mic and the output (ASIO on Windows), so choosing either on
+/// another device moves both.
+pub const ONE_DRIVER: bool = cfg!(windows);
+
+/// A device choice that moves both sides to another driver, until the user confirms it.
+pub enum PendingDevice {
+    Input(String),
+    Output(String),
+}
 
 pub struct Message {
     pub text: String,
@@ -114,6 +125,10 @@ pub struct App {
     pub confirm_delete: Option<u32>,
     pub calibration: Option<Calibration>,
     pub audio_dialog: bool,
+    /// Set when the devices dialog opens: the device lists are re-read once.
+    pub rescan_devices: bool,
+    /// A device picked on another ASIO driver, waiting for the user to confirm the switch.
+    pub pending_device: Option<PendingDevice>,
     pub export: Option<ExportDialog>,
     /// Song frames repeated while playing, set with "Loop phrase".
     pub loop_range: Option<(i64, i64)>,
@@ -166,6 +181,8 @@ impl App {
             confirm_delete: None,
             calibration: None,
             audio_dialog: false,
+            rescan_devices: false,
+            pending_device: None,
             export: None,
             loop_range: None,
             audition: None,
@@ -267,9 +284,10 @@ impl App {
         }
     }
 
-    /// Whether the transport may run: audio up, and the project (if any) at the server's rate.
+    /// Whether the transport may run: audio up (not waiting for the interface), and the project
+    /// (if any) at the server's rate.
     pub fn transport_ready(&self) -> bool {
-        self.engine.is_some()
+        self.engine.as_ref().is_some_and(|e| e.waiting().is_none())
             && self.session.as_ref().is_none_or(|s| s.rate_ok)
             && !self.calibrating()
     }
@@ -818,6 +836,10 @@ impl App {
         let Some(e) = &mut self.engine else { return };
         let r = e.set_input(&port);
         e.refresh_latency(self.config.calibration_frames);
+        if ONE_DRIVER {
+            // The output follows the mic to its driver.
+            self.config.output_device = Some(device_of(&port).to_string());
+        }
         self.config.input_port = Some(port);
         let _ = self.config.save();
         if let Err(msg) = r {
@@ -830,6 +852,16 @@ impl App {
         let Some(e) = &mut self.engine else { return };
         let r = e.set_output(&device);
         e.refresh_latency(self.config.calibration_frames);
+        if ONE_DRIVER
+            && self
+                .config
+                .input_port
+                .as_deref()
+                .is_some_and(|p| device_of(p) != device)
+        {
+            // The mic follows the output to its driver (first input there).
+            self.config.input_port = None;
+        }
         self.config.output_device = Some(device);
         let _ = self.config.save();
         if let Err(msg) = r {
@@ -939,8 +971,17 @@ impl App {
     // ---- per-frame event processing ---------------------------------------------------------
 
     pub fn process_events(&mut self) {
+        let mut take_interrupted = false;
         if let Some(e) = &mut self.engine {
             e.collect_garbage();
+            if std::mem::take(&mut self.rescan_devices) {
+                e.rescan_devices();
+            }
+            if ONE_DRIVER {
+                // Device switches finish on the audio thread; show them as soon as they do.
+                e.refresh_routing();
+            }
+            take_interrupted = e.take_interrupted();
             if self.last_latency_refresh.elapsed() > Duration::from_secs(1) {
                 // Rewiring mid-take would shift the rest of it by the new device's latency.
                 if !e.shared.recording.load(Relaxed) {
@@ -956,6 +997,9 @@ impl App {
                 self.engine_error =
                     Some("The audio server stopped. Restart the app to reconnect.".into());
             }
+        }
+        if take_interrupted {
+            self.hint(TAKE_INTERRUPTED);
         }
         if let Some(s) = &mut self.session {
             s.refresh_notes();

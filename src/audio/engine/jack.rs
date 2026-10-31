@@ -1,284 +1,40 @@
-//! JACK client (served by PipeWire through `pipewire-jack`): one process callback for capture and
-//! playback, the song clock, and the hand-off of mic audio to the live-pitch and disk threads.
-//!
-//! The callback never allocates, locks or does I/O: commands and audio arrive through lock-free
-//! rings, and replaced [`Playback`] snapshots are handed back to be dropped elsewhere.
+//! JACK driver (served by PipeWire through `pipewire-jack`): one client with a mic input and two
+//! outputs, whose process callback runs the shared [`Cycle`] on the ports' buffers.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 
 use jack::{
     AudioIn, AudioOut, Client, ClientOptions, Control, LatencyType, Port, PortFlags, ProcessScope,
 };
 
-use super::latency::compensation;
-use super::mixer::Playback;
-use super::speed::{Ratio, SongClock};
+use super::core::Cycle;
+use super::{Command, Routing, Shared, Streams, device_of, short_port};
+use crate::audio::latency::compensation;
+use crate::audio::mixer::Playback;
+use crate::audio::speed::Ratio;
 
 pub const CLIENT_NAME: &str = "tuned-record";
 /// Buffer size requested from PipeWire (`PIPEWIRE_LATENCY`), set before the client opens.
 pub const REQUESTED_BUFFER: u32 = 256;
-const COMMAND_CAPACITY: usize = 256;
-const HEADER_CAPACITY: usize = 4096;
-const LIVE_SECONDS: usize = 2;
-const DISK_SECONDS: usize = 10;
-
-pub enum Command {
-    Play,
-    Stop,
-    Seek(i64),
-    StartRecord,
-    StopRecord,
-    SetPlayback(Arc<Playback>),
-    /// Song frames `[start, end)` to repeat while playing (never while recording); `None` clears.
-    SetLoop(Option<(i64, i64)>),
-    /// Changes the practice speed and swaps in the playback rendered for it, in the same block,
-    /// so the clock and the audio never disagree. Ignored while recording.
-    SetSpeed {
-        speed: Ratio,
-        playback: Arc<Playback>,
-    },
-}
-
-/// State published by the audio thread, readable from any thread.
-#[derive(Default)]
-pub struct Shared {
-    pub song_pos: AtomicI64,
-    /// Current practice speed ([`Ratio::to_bits`]).
-    pub speed: AtomicU32,
-    pub playing: AtomicBool,
-    pub recording: AtomicBool,
-    /// Frames between output and capture to compensate (latency + calibration).
-    pub compensation: AtomicI64,
-    pub xruns: AtomicU32,
-    /// Mic blocks the live-pitch thread missed (gaps in the live line only).
-    pub dropped_live: AtomicU32,
-    /// Mic blocks lost from a recording because the disk thread fell behind (lost take audio).
-    pub dropped_disk: AtomicU32,
-    pub buffer_size: AtomicU32,
-    pub server_gone: AtomicBool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockKind {
-    Data,
-    TakeStart,
-    TakeEnd,
-}
-
-/// Describes the samples that follow it in the paired sample ring.
-#[derive(Debug, Clone, Copy)]
-pub struct BlockHeader {
-    pub kind: BlockKind,
-    /// Free-running frame counter (advances while stopped too).
-    pub wall_frame: u64,
-    /// Latency-compensated song frame of the first sample.
-    pub song_frame: i64,
-    pub len: u32,
-    pub playing: bool,
-    /// Speed the song clock ran at during this block.
-    pub speed: Ratio,
-}
-
-/// Consumer side of a mic stream (headers + samples).
-pub struct MicStream {
-    headers: rtrb::Consumer<BlockHeader>,
-    samples: rtrb::Consumer<f32>,
-}
-
-impl MicStream {
-    /// Pops the next block, replacing `buf` with its samples.
-    pub fn pop(&mut self, buf: &mut Vec<f32>) -> Option<BlockHeader> {
-        let h = self.headers.pop().ok()?;
-        buf.clear();
-        if h.len > 0 {
-            // The producer writes samples before the header, so they are available.
-            if let Ok(chunk) = self.samples.read_chunk(h.len as usize) {
-                let (a, b) = chunk.as_slices();
-                buf.extend_from_slice(a);
-                buf.extend_from_slice(b);
-                chunk.commit_all();
-            }
-        }
-        Some(h)
-    }
-}
-
-struct StreamProducer {
-    headers: rtrb::Producer<BlockHeader>,
-    samples: rtrb::Producer<f32>,
-}
-
-impl StreamProducer {
-    /// Writes samples then the header; returns false (writing nothing) if either ring is full.
-    fn push(&mut self, header: BlockHeader, samples: &[f32]) -> bool {
-        if self.headers.slots() == 0 || self.samples.slots() < samples.len() {
-            return false;
-        }
-        if let Ok(mut chunk) = self.samples.write_chunk_uninit(samples.len()) {
-            let (a, b) = chunk.as_mut_slices();
-            let split = a.len();
-            for (d, s) in a.iter_mut().zip(samples) {
-                d.write(*s);
-            }
-            for (d, s) in b.iter_mut().zip(&samples[split..]) {
-                d.write(*s);
-            }
-            // SAFETY: all `samples.len()` slots were initialised above.
-            unsafe { chunk.commit_all() };
-        }
-        self.headers.push(header).is_ok()
-    }
-}
-
-fn stream(capacity: usize) -> (StreamProducer, MicStream) {
-    let (hp, hc) = rtrb::RingBuffer::new(HEADER_CAPACITY);
-    let (sp, sc) = rtrb::RingBuffer::new(capacity);
-    (
-        StreamProducer {
-            headers: hp,
-            samples: sp,
-        },
-        MicStream {
-            headers: hc,
-            samples: sc,
-        },
-    )
-}
 
 struct Processor {
     input: Port<AudioIn>,
     out_l: Port<AudioOut>,
     out_r: Port<AudioOut>,
     shared: Arc<Shared>,
-    commands: rtrb::Consumer<Command>,
-    garbage: rtrb::Producer<Arc<Playback>>,
-    playback: Arc<Playback>,
-    live: StreamProducer,
-    disk: StreamProducer,
-    clock: SongClock,
-    wall: u64,
-    playing: bool,
-    recording: bool,
-    loop_range: Option<(i64, i64)>,
-}
-
-impl Processor {
-    fn header(&self, kind: BlockKind, song_frame: i64, len: usize) -> BlockHeader {
-        BlockHeader {
-            kind,
-            wall_frame: self.wall,
-            song_frame,
-            len: len as u32,
-            playing: self.playing,
-            speed: self.clock.ratio(),
-        }
-    }
-
-    /// Song frame of the mic sample captured now: the compensation is wall time, so it covers
-    /// fewer song frames when slowed.
-    fn captured_frame(&self, comp: i64) -> i64 {
-        self.clock.pos() - self.clock.ratio().to_song(comp)
-    }
-
-    fn retire(&mut self, old: Arc<Playback>) {
-        if let Err(rtrb::PushError::Full(old)) = self.garbage.push(old) {
-            // Never free on the audio thread; leaking is the lesser evil.
-            std::mem::forget(old);
-        }
-    }
-
-    fn stop_recording(&mut self, song_frame: i64) {
-        if self.recording {
-            self.recording = false;
-            let h = self.header(BlockKind::TakeEnd, song_frame, 0);
-            // The disk thread must see the end marker; retry is impossible here, so count a drop.
-            if !self.disk.push(h, &[]) {
-                self.shared.dropped_disk.fetch_add(1, Relaxed);
-            }
-        }
-    }
-
-    fn handle_commands(&mut self, comp: i64) {
-        while let Ok(cmd) = self.commands.pop() {
-            match cmd {
-                Command::Play => self.playing = true,
-                Command::Stop => {
-                    self.stop_recording(self.captured_frame(comp));
-                    self.playing = false;
-                }
-                Command::Seek(f) => {
-                    if !self.recording {
-                        self.clock.seek(f);
-                    }
-                }
-                // Takes are recorded at 100 % only.
-                Command::StartRecord => {
-                    if !self.recording && self.clock.ratio().is_one() {
-                        let h = self.header(BlockKind::TakeStart, self.captured_frame(comp), 0);
-                        self.recording = self.disk.push(h, &[]);
-                    }
-                }
-                Command::StopRecord => self.stop_recording(self.captured_frame(comp)),
-                Command::SetLoop(range) => self.loop_range = range.filter(|(s, e)| s < e),
-                Command::SetPlayback(new) => {
-                    let old = std::mem::replace(&mut self.playback, new);
-                    self.retire(old);
-                }
-                Command::SetSpeed { speed, playback } => {
-                    if self.recording {
-                        self.retire(playback);
-                    } else {
-                        self.clock.set_ratio(speed);
-                        let old = std::mem::replace(&mut self.playback, playback);
-                        self.retire(old);
-                    }
-                }
-            }
-        }
-    }
+    cycle: Cycle,
 }
 
 impl jack::ProcessHandler for Processor {
     fn process(&mut self, _: &Client, ps: &ProcessScope) -> Control {
-        let comp = self.shared.compensation.load(Relaxed);
-        self.handle_commands(comp);
-        let n = ps.n_frames() as usize;
-
-        let out_l = self.out_l.as_mut_slice(ps);
-        let out_r = self.out_r.as_mut_slice(ps);
-        out_l.fill(0.0);
-        out_r.fill(0.0);
-        if self.playing {
-            self.playback.mix_into(self.clock.pos(), out_l, out_r);
-        }
-
-        let mic = self.input.as_slice(ps);
-        let song_first = self.captured_frame(comp);
-        let h = self.header(BlockKind::Data, song_first, n);
-        if !self.live.push(h, mic) {
-            self.shared.dropped_live.fetch_add(1, Relaxed);
-        }
-        if self.recording && self.playing && !self.disk.push(h, mic) {
-            self.shared.dropped_disk.fetch_add(1, Relaxed);
-        }
-
-        if self.playing {
-            self.clock.advance(n as u64);
-            if let Some((start, end)) = self.loop_range
-                && !self.recording
-                && self.clock.pos() >= end
-            {
-                self.clock.seek(start);
-            }
-        }
-        self.wall += n as u64;
-        self.shared.song_pos.store(self.clock.pos(), Relaxed);
-        self.shared
-            .speed
-            .store(self.clock.ratio().to_bits(), Relaxed);
-        self.shared.playing.store(self.playing, Relaxed);
-        self.shared.recording.store(self.recording, Relaxed);
+        let comp = self
+            .cycle
+            .render(self.out_l.as_mut_slice(ps), self.out_r.as_mut_slice(ps));
+        // Fetch the mic buffer only after the outputs are written: pipewire-jack mixes an input
+        // port's buffer when it is requested, so a self-patched loopback (out_l → mic_in) hears
+        // this period's output, as `loopback_check` relies on.
+        self.cycle.capture(self.input.as_slice(ps), comp);
         Control::Continue
     }
 
@@ -314,31 +70,6 @@ pub struct Engine {
     pub playback_latency: u32,
     pub capture_latency: u32,
     pub routing: Routing,
-}
-
-/// What the app's ports are connected to, as last read by [`Engine::refresh_routing`].
-#[derive(Debug, Clone, Default)]
-pub struct Routing {
-    /// Full names of the ports feeding `mic_in`.
-    pub input: Vec<String>,
-    /// Full names of the ports `out_l` and `out_r` play into.
-    pub output: Vec<String>,
-}
-
-/// The JACK client (device) part of a full port name.
-pub fn device_of(port: &str) -> &str {
-    port.split_once(':').map_or(port, |(d, _)| d)
-}
-
-/// The port part of a full port name.
-pub fn short_port(port: &str) -> &str {
-    port.split_once(':').map_or(port, |(_, p)| p)
-}
-
-/// Mic streams handed to the consumer threads.
-pub struct Streams {
-    pub live: MicStream,
-    pub disk: MicStream,
 }
 
 /// Loads PipeWire's `libjack` (from `pipewire-jack`) so the app runs without the `pw-jack`
@@ -413,26 +144,13 @@ impl Engine {
 
         let shared = Arc::new(Shared::default());
         shared.buffer_size.store(client.buffer_size(), Relaxed);
-        let (cmd_tx, cmd_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
-        let (garbage_tx, garbage_rx) = rtrb::RingBuffer::new(COMMAND_CAPACITY);
-        let (live_tx, live_rx) = stream(sample_rate as usize * LIVE_SECONDS);
-        let (disk_tx, disk_rx) = stream(sample_rate as usize * DISK_SECONDS);
-
+        let (cycle, control, streams) = Cycle::new(shared.clone(), sample_rate);
         let processor = Processor {
             input,
             out_l,
             out_r,
             shared: shared.clone(),
-            commands: cmd_rx,
-            garbage: garbage_tx,
-            playback: Arc::new(Playback::default()),
-            live: live_tx,
-            disk: disk_tx,
-            clock: SongClock::default(),
-            wall: 0,
-            playing: false,
-            recording: false,
-            loop_range: None,
+            cycle,
         };
         let client = client
             .activate_async(
@@ -446,8 +164,8 @@ impl Engine {
         let mut engine = Self {
             client,
             shared,
-            commands: cmd_tx,
-            garbage: garbage_rx,
+            commands: control.commands,
+            garbage: control.garbage,
             sample_rate,
             in_port,
             out_ports,
@@ -456,13 +174,7 @@ impl Engine {
             routing: Routing::default(),
         };
         engine.keep_routed(input_port, output_device);
-        Ok((
-            engine,
-            Streams {
-                live: live_rx,
-                disk: disk_rx,
-            },
-        ))
+        Ok((engine, streams))
     }
 
     /// Mono audio ports with `flags` of clients other than this app (or another instance of it),
@@ -598,6 +310,24 @@ impl Engine {
             compensation(self.playback_latency, self.capture_latency, calibration),
             Relaxed,
         );
+    }
+
+    /// Device lists are read live from JACK; nothing to rescan.
+    pub fn rescan_devices(&mut self) {}
+
+    /// Audio never waits for a device here: a lost server is reported through `server_gone`.
+    pub fn waiting(&self) -> Option<String> {
+        None
+    }
+
+    /// Device changes apply at once here.
+    pub fn switching(&self) -> Option<String> {
+        None
+    }
+
+    /// Takes are never cut short by the driver here.
+    pub fn take_interrupted(&mut self) -> bool {
+        false
     }
 
     /// The JACK client, for inspecting or rewiring connections.

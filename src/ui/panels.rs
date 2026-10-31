@@ -3,7 +3,7 @@
 
 use egui::{Align, Color32, Layout, RichText, Stroke, Ui, Vec2, WidgetInfo, WidgetType};
 
-use super::app::{App, Calibration, NEEDS_FULL_SPEED};
+use super::app::{App, Calibration, NEEDS_FULL_SPEED, ONE_DRIVER, PendingDevice};
 use super::plot::{self, PlotInput};
 use super::theme;
 use super::timeline::{self, OverviewInput};
@@ -121,7 +121,12 @@ fn device_summary(routing: &Routing) -> (String, String, bool) {
     let output = routing.output.first().map(|p| device_of(p));
     let text = format!(
         "🎤 {}  🔊 {}",
-        input.map_or("none".into(), |p| short_device(device_of(p))),
+        input.map_or("none".into(), |p| if ONE_DRIVER {
+            // Same driver on both sides: the channel is what tells the inputs apart.
+            format!("{} · {}", short_device(device_of(p)), short_port(p))
+        } else {
+            short_device(device_of(p))
+        }),
         output.map_or("none".into(), short_device),
     );
     let label = format!(
@@ -291,7 +296,7 @@ impl App {
                 }
                 if labeled_button(
                     ui,
-                    self.engine.is_some() && !recording,
+                    self.engine.as_ref().is_some_and(|e| e.waiting().is_none()) && !recording,
                     "Calibrate…",
                     "Measure latency with a loopback",
                 ) {
@@ -321,13 +326,18 @@ impl App {
                         }
                         ui.label(RichText::new(status).monospace().color(theme::TEXT_DIM));
                         let (text, label, ok) = device_summary(&e.routing);
-                        let text = if ok {
-                            RichText::new(text)
-                        } else {
-                            RichText::new(text).color(theme::OFF)
+                        let (text, label) = match e.waiting() {
+                            // In place of the devices: why there is no audio right now.
+                            Some(why) => (
+                                RichText::new(format!("⚠ {why}")).color(theme::NEAR),
+                                format!("{why} (click to choose another audio device)"),
+                            ),
+                            None if ok => (RichText::new(text), label),
+                            None => (RichText::new(text).color(theme::OFF), label),
                         };
                         if labeled_button(ui, true, text, &label) {
                             self.audio_dialog = true;
+                            self.rescan_devices = true;
                         }
                         // Right to left: the meter sits just before the devices; its warning text
                         // goes on the line below (no room here).
@@ -1024,12 +1034,25 @@ impl App {
             let current_in = e.routing.input.first().cloned();
             let current_out = e.routing.output.first().map(|p| device_of(p).to_string());
             let recording = self.recording();
+            let switching = e.switching();
             let mut new_in = None;
             let mut new_out = None;
             let mut close = false;
+            // A pick on another driver moves both sides there: confirm it first.
+            let pending = self.pending_device.as_ref().map(|p| match p {
+                PendingDevice::Input(port) => (
+                    device_of(port).to_string(),
+                    format!("Output will move to {} too.", device_of(port)),
+                ),
+                PendingDevice::Output(d) => (
+                    d.clone(),
+                    format!("Microphone will move to {d} · in 1 too."),
+                ),
+            });
+            let (mut confirm, mut cancel) = (false, false);
             egui::Modal::new(egui::Id::new("audio-devices")).show(ctx, |ui| {
                 ui.heading("Audio devices");
-                ui.add_enabled_ui(!recording, |ui| {
+                ui.add_enabled_ui(!recording && pending.is_none() && switching.is_none(), |ui| {
                     egui::ComboBox::from_label("Microphone")
                         .width(320.0)
                         .selected_text(current_in.as_deref().map_or("not connected".into(), port_label))
@@ -1054,26 +1077,70 @@ impl App {
                 if recording {
                     ui.colored_label(theme::NEAR, "Stop recording to change devices.");
                 }
-                ui.label(
-                    RichText::new(
-                        "The app records one mono channel: pick the input your microphone is plugged into. \
-                         The choice is remembered and used whenever the device is present. \
-                         The latency calibration is not per device: run Calibrate… again after switching interfaces.",
-                    )
-                    .color(theme::TEXT_DIM),
+                if let Some((driver, what)) = &pending {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(theme::NEAR, format!("⚠ {what}"));
+                        let switch = ui.button(format!("Switch to {driver}"));
+                        // Focus lands on the confirmation when the row appears.
+                        let first = egui::Id::new("audio-devices-confirm-shown");
+                        if !ui.data(|d| d.get_temp::<bool>(first).unwrap_or(false)) {
+                            switch.request_focus();
+                            ui.data_mut(|d| d.insert_temp(first, true));
+                        }
+                        confirm = switch.clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                } else {
+                    ui.data_mut(|d| d.remove::<bool>(egui::Id::new("audio-devices-confirm-shown")));
+                }
+                if let Some(d) = &switching {
+                    ui.colored_label(theme::TEXT_DIM, format!("Switching to {d}…"));
+                }
+                let mut help = String::from(
+                    "The app records one mono channel: pick the input your microphone is plugged into. \
+                     The choice is remembered and used whenever the device is present. \
+                     The latency calibration is not per device: run Calibrate… again after switching interfaces.",
                 );
-                if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if ONE_DRIVER {
+                    help.push_str(" The buffer size is set in your interface's ASIO control panel.");
+                }
+                ui.label(RichText::new(help).color(theme::TEXT_DIM));
+                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if escape && pending.is_some() {
+                    cancel = true;
+                } else if ui.button("Close").clicked() || escape {
                     close = true;
                 }
             });
+            let current_driver = current_out.clone();
+            let elsewhere = |driver: &str| ONE_DRIVER && current_driver.as_deref() != Some(driver);
             if let Some(p) = new_in {
-                self.select_input(p);
+                if elsewhere(device_of(&p)) {
+                    self.pending_device = Some(PendingDevice::Input(p));
+                } else {
+                    self.select_input(p);
+                }
             }
             if let Some(d) = new_out {
-                self.select_output(d);
+                if elsewhere(&d) {
+                    self.pending_device = Some(PendingDevice::Output(d));
+                } else {
+                    self.select_output(d);
+                }
+            }
+            if confirm {
+                match self.pending_device.take() {
+                    Some(PendingDevice::Input(p)) => self.select_input(p),
+                    Some(PendingDevice::Output(d)) => self.select_output(d),
+                    None => {}
+                }
+            }
+            if cancel {
+                self.pending_device = None;
             }
             if close {
                 self.audio_dialog = false;
+                self.pending_device = None;
             }
         }
 

@@ -17,13 +17,15 @@
 //!   cargo run --release --example loopback_check -- --physical
 //!       Keeps the default hardware connections: plug a cable from the audio output into the
 //!       input first (the clicks go out through the output). This is the real end-to-end test.
+//!       On Windows this is the only mode: it uses the ASIO driver and mic input chosen in the app
+//!       (`tuned-record.exe` config), and also prints the driver's callback order.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, unbounded};
-use tuned_record::audio::engine::{Command, Engine, request_low_latency};
+use tuned_record::audio::engine::{Command, Engine};
 use tuned_record::audio::latency::{click_track, residual_by_xcorr};
 use tuned_record::audio::mixer::{Audio, Playback, Track};
 use tuned_record::audio::speed::Ratio;
@@ -38,29 +40,22 @@ use tuned_record::project::export::{ExportInput, export};
 use tuned_record::project::takes::{DiskControl, DiskEvent, spawn_disk_thread, take_path};
 
 fn main() {
-    request_low_latency();
-    let (mut engine, streams) = Engine::start().unwrap_or_else(|e| {
+    #[cfg(target_os = "linux")]
+    tuned_record::audio::engine::request_low_latency();
+    let physical = std::env::args().any(|a| a == "--physical");
+    if cfg!(windows) && !physical {
+        eprintln!("On Windows only --physical is supported: cable an output into the mic input.");
+        std::process::exit(1);
+    }
+    let (mut engine, streams) = start_engine().unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1)
     });
     let rate = engine.sample_rate;
-    let (in_port, outs) = {
-        let (i, o) = engine.port_names();
-        (i.to_string(), o.clone())
-    };
-    let physical = std::env::args().any(|a| a == "--physical");
     if physical {
         println!("physical loopback: {:?}", engine.routing);
     } else {
-        let c = engine.client();
-        for p in c.ports(None, None, jack::PortFlags::empty()) {
-            let _ = c.disconnect_ports_by_name(&p, &in_port);
-            for o in &outs {
-                let _ = c.disconnect_ports_by_name(o, &p);
-            }
-        }
-        c.connect_ports_by_name(&outs[0], &in_port)
-            .expect("patch out_l → mic_in");
+        self_patch(&engine);
     }
     std::thread::sleep(Duration::from_millis(300));
     engine.refresh_latency(0);
@@ -69,6 +64,16 @@ fn main() {
         engine.buffer_size(),
         engine.playback_latency,
         engine.capture_latency
+    );
+    #[cfg(windows)]
+    println!(
+        "ASIO callback order: {} (mic block {} frames late, included in capture)",
+        if engine.callback_lag() == 0 {
+            "input before output"
+        } else {
+            "output before input"
+        },
+        engine.callback_lag()
     );
 
     let dir = std::env::temp_dir().join(format!("tuned-record-loopback-{}", std::process::id()));
@@ -185,6 +190,41 @@ fn main() {
         println!("FAIL");
         std::process::exit(2);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn start_engine() -> Result<(Engine, tuned_record::audio::engine::Streams), String> {
+    Engine::start()
+}
+
+/// The driver and mic input chosen in the app.
+#[cfg(windows)]
+fn start_engine() -> Result<(Engine, tuned_record::audio::engine::Streams), String> {
+    let config = tuned_record::config::Config::load();
+    Engine::start_routed(
+        config.input_port.as_deref(),
+        config.output_device.as_deref(),
+    )
+}
+
+/// Patches `out_l` straight into `mic_in` inside JACK, disconnecting everything else.
+#[cfg(target_os = "linux")]
+fn self_patch(engine: &Engine) {
+    let (in_port, outs) = engine.port_names();
+    let c = engine.client();
+    for p in c.ports(None, None, jack::PortFlags::empty()) {
+        let _ = c.disconnect_ports_by_name(&p, in_port);
+        for o in outs {
+            let _ = c.disconnect_ports_by_name(o, &p);
+        }
+    }
+    c.connect_ports_by_name(&outs[0], in_port)
+        .expect("patch out_l → mic_in");
+}
+
+#[cfg(windows)]
+fn self_patch(_: &Engine) {
+    unreachable!("checked in main");
 }
 
 /// Plays `audio` from song frame 0 while recording, until it has passed.

@@ -1,0 +1,17 @@
+# Cross-building the Windows app from Linux with MinGW (see scripts/build-windows.sh).
+# Everything is linked statically, so the .exe needs only Windows system DLLs.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc-posix"
+rustflags = [
+  # libstdc++.a for the static C++ runtime below (Debian/Ubuntu mingw-w64, GCC 13, posix threads).
+  "-L", "native=/usr/lib/gcc/x86_64-w64-mingw32/13-posix",
+  "-C", "link-args=-static -static-libgcc -static-libstdc++",
+]
+
+[env]
+# The C++ parts (ASIO SDK glue, signalsmith-stretch) use the posix-threads MinGW toolchain, and
+# their libstdc++ is linked statically (the `cc` crate would otherwise link it as a DLL).
+CC_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-gcc-posix"
+CXX_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-g++-posix"
+CXXSTDLIB_x86_64_pc_windows_gnu = "static=stdc++"
+BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnu = "--target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32"

@@ -4,7 +4,8 @@ Sing over songs while seeing your pitch live, follow the pitch contour of a refe
 (a demucs-separated stem), and stack takes into harmonies and choruses. Every take stays on the
 timeline as its own contour; export gives aligned WAVs for a DAW.
 
-Linux only. Audio goes through the JACK API on PipeWire.
+Runs on Linux, where audio goes through the JACK API on PipeWire, and on Windows with an audio
+interface that has its own ASIO driver (see [Windows](#windows)).
 
 ## Setup
 
@@ -103,11 +104,56 @@ Settings and takes are saved continuously; takes are written to disk while recor
 | Delete | delete the selected take (asks first) |
 | Tab / Enter | move between controls / activate |
 
+## Windows
+
+The Windows app is built on this Linux machine and packaged as a setup program; nothing is built
+on Windows. It needs an audio interface with its own (native) ASIO driver: the mic and the output
+are channels of that one driver.
+
+### Build (on Linux)
+
+```sh
+sudo apt install mingw-w64 nsis clang libclang-dev unzip curl
+rustup target add x86_64-pc-windows-gnu
+scripts/build-windows.sh           # → target/windows/tuned-record-setup-<version>.exe
+scripts/build-windows.sh --smoke   # also starts the .exe under Wine for 20 s
+```
+
+The first run downloads Steinberg's ASIO SDK into `~/.cache/tuned-record/asiosdk`. The .exe is
+linked statically (only Windows system DLLs). `vendor/asio-sys` is a patched copy of a cpal
+dependency that makes the ASIO bindings build with MinGW (see `vendor/asio-sys/TUNED-RECORD.md`).
+
+**Licence note:** the ASIO SDK compiled into the .exe is dual-licensed by Steinberg: under its own
+licence (publishing software needs an agreement signed by Steinberg) or under GPL v3. Giving the
+setup program to someone else is distribution under one of those two.
+
+### Install (on Windows)
+
+1. Run `tuned-record-setup-<version>.exe`. It is not signed, so Windows shows "Windows protected
+   your PC": choose **More info → Run anyway**. It installs for the current user only (no admin
+   rights) and adds tuned-record to the Start menu.
+2. Start tuned-record, click the device button (🎤 / 🔊) and pick the interface's mic input. Mic
+   and output always use the same ASIO driver; picking an input on another interface moves the
+   output there too (the dialog asks first).
+3. Calibrate once (below) with a cable from an output of the interface into the mic input.
+
+The buffer size is set in the interface's ASIO control panel, not in the app. Changing it, or
+unplugging the interface, doesn't need a restart: the app waits ("Audio is waiting for the
+interface…") and continues where it was; a take being recorded stops and is kept up to that
+point. Settings and the calibration live in `%APPDATA%\tuned-record\config.toml` and survive
+reinstalling; uninstalling (Windows' installed apps list) leaves them and all recordings alone. A
+crash leaves its message in `%APPDATA%\tuned-record\crash.log`.
+
+To check alignment on Windows, copy `target/windows/loopback_check.exe` (built by the script) to
+the Windows PC and run `loopback_check.exe --physical` in a terminal with the cable in place; it
+uses the driver and input chosen in the app and also prints the driver's callback order.
+
 ## Latency calibration
 
 **Calibrate…** plays clicks and measures them coming back. Connect the output to the input first
 (a cable from line/headphone out to line/mic in). The measured residual (on top of the latency
-JACK reports) is stored in `~/.config/tuned-record/config.toml` and applied to every take.
+JACK or the ASIO driver reports) is stored in `~/.config/tuned-record/config.toml`
+(`%APPDATA%\tuned-record\config.toml` on Windows) and applied to every take.
 
 ## Checks
 

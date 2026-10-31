@@ -1,4 +1,5 @@
-//! Per-machine settings in `~/.config/tuned-record/config.toml`.
+//! Per-machine settings in `config.toml` under the user's config folder (`~/.config/tuned-record`
+//! on Linux, `%APPDATA%\tuned-record` on Windows).
 
 use std::path::PathBuf;
 
@@ -13,10 +14,12 @@ pub struct Config {
     pub calibration_frames: i64,
     #[serde(default)]
     pub recent_projects: Vec<PathBuf>,
-    /// Full JACK name of the port to record from, used whenever it is present.
+    /// Full name of the input to record from (`device:port`: a JACK port on Linux, `driver:in N`
+    /// on Windows), used whenever it is present.
     #[serde(default)]
     pub input_port: Option<String>,
-    /// JACK client (device) to play into, used whenever it is present.
+    /// Device to play into (a JACK client on Linux, an ASIO driver on Windows), used whenever it
+    /// is present.
     #[serde(default)]
     pub output_device: Option<String>,
 }

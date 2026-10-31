@@ -1,10 +1,11 @@
 //! Starts the engine, prints what it negotiated, and checks the callback runs.
 //! Run with: cargo run --example probe
 use std::sync::atomic::Ordering::Relaxed;
-use tuned_record::audio::engine::{Engine, request_low_latency};
+use tuned_record::audio::engine::Engine;
 
 fn main() {
-    request_low_latency();
+    #[cfg(target_os = "linux")]
+    tuned_record::audio::engine::request_low_latency();
     let (mut engine, mut streams) = match Engine::start() {
         Ok(e) => e,
         Err(e) => {

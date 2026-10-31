@@ -7,14 +7,15 @@
 
 ## Purpose
 
-Linux desktop tool for a singer: record yourself over songs with a live pitch contour, follow
+Desktop tool for a singer (Linux, and Windows with an ASIO audio interface): record yourself over songs with a live pitch contour, follow
 the pitch contour of a demucs-separated reference vocal (transposable, visible ahead of the
 playhead), stack aligned takes into harmonies/choruses, and export them to a DAW.
 
 ## Tech Stack
 
-Rust (edition 2024), single crate `tuned-record` (lib + bin). Audio: `jack` crate over PipeWire
-(`pipewire-jack`), lock-free rings with `rtrb`. GUI: `eframe`/`egui`. Pitch: own McLeod/NSDF on
+Rust (edition 2024), single crate `tuned-record` (lib + bin). Audio: a platform-free engine cycle
+driven by the `jack` crate over PipeWire (`pipewire-jack`) on Linux and by `cpal` with its ASIO host
+on Windows (cross-compiled from Linux with MinGW, packaged with NSIS); lock-free rings with `rtrb`. GUI: `eframe`/`egui`. Pitch: own McLeod/NSDF on
 `realfft` (live), `pyin` + MPM refinement (offline). Files: `symphonia` (decode), `rubato`
 (resample), `hound` (WAV). Project manifest: `serde` + `toml`; cache keys: `blake3`.
 
@@ -44,12 +45,18 @@ Flujo completo en `openspec/README.md`; reglas duras en `openspec/CONVENTIONS.md
 
 ## Important Constraints
 
-- Linux only; needs `pipewire-jack` at runtime (the engine preloads PipeWire's libjack, so no
+- Linux: needs `pipewire-jack` at runtime (the engine preloads PipeWire's libjack, so no
   `pw-jack` wrapper) and `libjack-jackd2-dev` to build (pkg-config `jack.pc`).
-- The JACK process callback must stay real-time safe: no allocation, locks or I/O. Audio and
-  commands cross threads only through lock-free rings; retired buffers are dropped off-thread.
+- Windows: needs an audio interface with a native ASIO driver; mic and output are channels of that
+  one driver. Built on Linux only (`scripts/build-windows.sh`), no CI; the ASIO SDK is
+  dual-licensed by Steinberg (own licence or GPL v3).
+- The app's audio callback code must stay real-time safe: no allocation, locks or I/O. Audio and
+  commands cross threads only through lock-free rings; retired buffers are dropped off-thread. On
+  Windows the ASIO glue (cpal, asio-sys) takes uncontended locks of its own each period; that is
+  accepted, outside the app's code.
 - Every captured sample is placed on the song timeline with latency compensation
   (reported port latencies + per-machine calibration); takes and exports must stay
   sample-aligned to song t=0.
-- A project's sample rate is fixed at creation and must match the server's to play or record.
+- A project's sample rate is fixed at creation and must match the audio device's (JACK server's
+  or ASIO driver's) to play or record.
 - Headphones are assumed (playback reaching the mic would be tracked as the singer's pitch).
